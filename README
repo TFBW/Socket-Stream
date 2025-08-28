@@ -1,0 +1,46 @@
+Socket-Stream
+
+High-level IO abstraction for SOCK_STREAM sockets
+
+This module provides an IO management wrapper for SOCK_STREAM sockets
+(e.g. TCP/IP) intended to facilitate the implementation of protocols
+over such a socket.  This frees the programmer from the minutiae of
+handling partial data transfers and interrupts, and the complexity of
+IO in general and sockets in particular.
+
+
+INSTALLATION
+
+To install this module, run the following commands:
+
+	perl Makefile.PL
+	make
+	make test
+	make install
+
+SUPPORT AND DOCUMENTATION
+
+After installing, you can find documentation for this module with the
+perldoc command.
+
+    perldoc Socket::Stream
+
+You can also look for information at:
+
+    RT, CPAN's request tracker (report bugs here)
+        https://rt.cpan.org/NoAuth/Bugs.html?Dist=Socket-Stream
+
+    CPAN Ratings
+        https://cpanratings.perl.org/d/Socket-Stream
+
+    Search CPAN
+        https://metacpan.org/release/Socket-Stream
+
+
+LICENSE AND COPYRIGHT
+
+This software is copyright (c) 2025 by Brett Watson.
+
+This is free software; you can redistribute it and/or modify it under
+the same terms as the Perl 5 programming language system itself.
+
