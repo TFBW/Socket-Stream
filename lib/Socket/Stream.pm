@@ -51,6 +51,8 @@ sub USING_AE { exists(&AnyEvent::io) }
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
+### Functions
+
 sub _make_io_socket {
     my ($class, %args) = @_;
     $args{Type} = Socket::SOCK_STREAM();
@@ -67,6 +69,19 @@ sub UNIX {
     return _make_io_socket('IO::Socket::UNIX', @_);
 }
 
+sub pair {
+    socketpair(
+        my $left,
+        my $right,
+        Socket::AF_UNIX(),
+        Socket::SOCK_STREAM(),
+        Socket::PF_UNSPEC()
+        ) or _die("Can't create socket pair: $!");
+    return ($left, $right);
+}
+
+### Class methods
+
 sub new {
     my ($class, $sock) = @_;
     $sock->blocking(0);
@@ -79,6 +94,8 @@ sub new {
     $self->start_timer; # populate TIMER
     return $self;
 }
+
+### Instance methods
 
 sub delimiter { @_ == 1 ? $_[0][DELIM] : do { $_[0][DELIM] = $_[1]; $_[0] } }
 sub use_CRLF  { $_[0][DELIM] = "\x0D\x0A"; $_[0] }
@@ -128,31 +145,6 @@ sub recv_eof { $_[0][EOF]  }
 sub recv_err { $_[0][RERR] }
 sub recv_end { !!($_[0][EOF] || $_[0][RERR]) }
 sub send_err { $_[0][SERR] }
-
-# Start timer before calling
-sub await_io {
-    my ($self, $mode) = @_; # $mode: 0=read, 1=write
-    if (USING_AE) {
-        #@! await_io @{[$mode?'write':'read']} using AE
-        my $cv = AnyEvent->condvar;
-        my $ww = AnyEvent->io(fh => $self->[SOCK], poll => $mode ? 'w' : 'r', cb => $cv);
-        my $t  = AnyEvent->timer(after => $self->time_left, cb => $cv)
-            if $self->has_timeout;
-        $cv->recv; # pause until unblocked or timed-out
-    }
-    else {
-        #@! await_io @{[$mode?'write':'read']} using select
-        do {
-            my $evec = $self->[VEC];
-            my $rvec = $mode ? undef : $evec;
-            my $wvec = $mode ? $evec : undef;
-            $! = 0;
-            select $rvec, $wvec, $evec, $self->time_left;
-        } while $!{EINTR};
-    }
-    #@! await_io done
-    return;
-}
 
 sub send_msg {
     my $self = shift;
@@ -293,6 +285,31 @@ sub await_data {
     return;
 }
 
+# Start timer before calling
+sub await_io {
+    my ($self, $mode) = @_; # $mode: 0=read, 1=write
+    if (USING_AE) {
+        #@! await_io @{[$mode?'write':'read']} using AE
+        my $cv = AnyEvent->condvar;
+        my $ww = AnyEvent->io(fh => $self->[SOCK], poll => $mode ? 'w' : 'r', cb => $cv);
+        my $t  = AnyEvent->timer(after => $self->time_left, cb => $cv)
+            if $self->has_timeout;
+        $cv->recv; # pause until unblocked or timed-out
+    }
+    else {
+        #@! await_io @{[$mode?'write':'read']} using select
+        do {
+            my $evec = $self->[VEC];
+            my $rvec = $mode ? undef : $evec;
+            my $wvec = $mode ? $evec : undef;
+            $! = 0;
+            select $rvec, $wvec, $evec, $self->time_left;
+        } while $!{EINTR};
+    }
+    #@! await_io done
+    return;
+}
+
 1;
 __END__
 
@@ -345,6 +362,9 @@ termination, discard the object and close the socket.
 This module is able to use L<AnyEvent> if it is loaded.  It is not
 required, but if it is present then all the "blocking" operations are
 executed in such a way that the main event loop runs while waiting.
+This also means that the "blocking" operations can't be called from
+within the event loop, such as from IO watchers: you will elecit a
+"recursive blocking wait attempted" exception if you do.
 
 Similarly, the module uses L<Carp> to complain about incorrect usage
 or other fatal errors if it is already present in memory, falling back
@@ -352,14 +372,19 @@ to vanilla die() otherwise.
 
 =head1 FUNCTIONS
 
-A couple of functions are provided for convenience.  They are not
-exported: use the fully-qualified names or alias them as you see fit.
-These are both factory functions for making L<IO::Socket> objects:
-Socket::Stream::INET() for INET sockets, and Socket::Stream::UNIX()
-for UNIX sockets.  These are simply wrappers for the respective
-L<IO::Socket::INET> and L<IO::Socket::UNIX> new() methods with Type
-set to SOCK_STREAM and an exception on failure.  Other than that, they
-have the same signature as the associated new() methods.
+A few socket-creating functions are provided for convenience.  They
+are not exported: use the fully-qualified names or alias them as you
+see fit.
+
+Socket::Stream::INET() and Socket::Stream::UNIX() are wrappers around
+the respective L<IO::Socket::INET> and L<IO::Socket::UNIX> new()
+methods with Type set to SOCK_STREAM and an exception thrown on
+failure.  Other than that, they have the same signature as the new()
+methods they wrap.
+
+Additionally, C<< ($s1, $s2) = Socket::Stream::pair(); >> is a wrapper
+around the socketpair() builtin which returns two connected UNIX
+SOCK_STREAM sockets, assuming your platform supports it.
 
 =head1 METHODS
 
