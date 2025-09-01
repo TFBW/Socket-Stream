@@ -218,17 +218,18 @@ sub _take_msg {
 sub recv_re {
     my ($self, $re) = @_;
     $self->start_timer;
-    until ($self->[RECV] =~ $re) {
-        $self->await_data
-            or return undef;
+    for ($self->[RECV]) {
+        until (/$re/g) { $self->await_data or return undef }
+        return substr($_, 0, pos($_), '');
     }
-    return substr($self->[RECV], 0, $+[0], '');
 }
 
 sub recv_re_nb {
     my ($self, $re) = @_;
     $self->recv_status; # read what you can
-    if ($self->[RECV] =~ $re) { return substr($self->[RECV], 0, $+[0], '') }
+    for ($self->[RECV]) {
+        if (/$re/g) { return substr($_, 0, pos($_), '') }
+    }
     $self->set_recv_err($! = EMSGSIZE)
         if $self->buffer_full;
     return;
