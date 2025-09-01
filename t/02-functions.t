@@ -7,25 +7,22 @@ use IO::Socket ();
 use Socket ();
 use Socket::Stream;
 
- SKIP:
-{
-    skip "Platform does not support AF_INET", 1
-        unless eval { IO::Socket->new(Domain => Socket::AF_INET) };
+subtest 'AF_INET' => sub {
+    plan skip_all => "Platform does not support AF_INET"
+        unless eval { IO::Socket->new(Domain => Socket::AF_INET()) };
     my $sock = Socket::Stream::INET();
     isa_ok($sock, 'IO::Socket::INET', 'Socket::Stream::INET()');
-}
+};
 
- SKIP:
-{
-    skip "Platform does not support AF_UNIX", 1
-        unless eval { IO::Socket->new(Domain => Socket::AF_UNIX) };
+subtest 'AF_UNIX' => sub {
+    plan skip_all => "Platform does not support AF_UNIX"
+        unless eval { IO::Socket->new(Domain => Socket::AF_UNIX()) };
     my $sock = Socket::Stream::UNIX();
     isa_ok($sock, 'IO::Socket::UNIX', 'Socket::Stream::UNIX()');
-}
+};
 
- SKIP:
-{
-    skip "Platform does not suport socketpair", 2
+subtest 'socketpair' => sub {
+    plan skip_all => "Platform does not suport socketpair"
         unless eval { socketpair(my $s1, my $s2,
                                  Socket::AF_UNIX(),
                                  Socket::SOCK_STREAM(),
@@ -35,4 +32,4 @@ use Socket::Stream;
     ok(-S $s2, 's2 is a socket');
 };
 
-done_testing(4);
+done_testing(3);
