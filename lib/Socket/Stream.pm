@@ -14,6 +14,8 @@ use Socket ();
 use Time::Left qw(to_seconds);
 
 use constant DEFAULT_MAX_READ => 2 ** 18; # 256K
+use constant EBADF
+    => exists(&Errno::EBADF) ? ($! = Errno::EBADF()) : dualvar(199, "Bad file descriptor");
 use constant EMSGSIZE
     => exists(&Errno::EMSGSIZE) ? ($! = Errno::EMSGSIZE()) : dualvar(200, "Message too long");
 use constant ETIMEDOUT
@@ -47,7 +49,7 @@ use constant do {
 
 # Not-quite-constants
 sub BLOCKED  { $!{EAGAIN} || $!{EWOULDBLOCK} }
-sub USING_AE { exists(&AnyEvent::io) }
+sub USING_AE { exists(&AE::io) }
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
@@ -70,14 +72,11 @@ sub UNIX {
 }
 
 sub pair {
-    socketpair(
-        my $left,
-        my $right,
-        Socket::AF_UNIX(),
-        Socket::SOCK_STREAM(),
-        Socket::PF_UNSPEC()
-        ) or _die("Can't create socket pair: $!");
-    return ($left, $right);
+    my ($l, $r);
+    package Socket; # for the consts
+    socketpair($l, $r, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or _die("Can't create socket pair: $!");
+    return ($l, $r);
 }
 
 ### Class methods
@@ -145,6 +144,7 @@ sub recv_eof { $_[0][EOF]  }
 sub recv_err { $_[0][RERR] }
 sub recv_end { !!($_[0][EOF] || $_[0][RERR]) }
 sub send_err { $_[0][SERR] }
+sub data_end { length($_[0][RECV]) == 0 && $_[0][EOF] }
 
 sub send_msg {
     my $self = shift;
@@ -154,6 +154,10 @@ sub send_msg {
 sub send_data {
     my $self = shift;
     return if $self->[SERR]; # no send possible after error
+    unless ($self->[SOCK]->opened) {
+        $self->set_send_err($! = EBADF);
+        return;
+    }
     my $data = join('', @_);
     return if $data eq '';
     my $n;
@@ -257,6 +261,10 @@ sub recv_data_nb {
 sub recv_status {
     my ($self) = @_;
     return 0 if $self->[RERR] or $self->[EOF];
+    unless ($self->[SOCK]->opened) {
+        $self->set_recv_err($! = EBADF);
+        return 0;
+    }
     my $n = $self->buffer_free;
     return -2 if $n <= 0;
     $n = 0 if $n < 0;
@@ -289,11 +297,12 @@ sub await_data {
 # Start timer before calling
 sub await_io {
     my ($self, $mode) = @_; # $mode: 0=read, 1=write
+    return unless $self->[SOCK]->opened;
     if (USING_AE) {
         #@! await_io @{[$mode?'write':'read']} using AE
-        my $cv = AnyEvent->condvar;
-        my $ww = AnyEvent->io(fh => $self->[SOCK], poll => $mode ? 'w' : 'r', cb => $cv);
-        my $t  = AnyEvent->timer(after => $self->time_left, cb => $cv)
+        my $cv = AE::cv();
+        my $w  = AE::io($self->[SOCK], $mode ? 1 : 0, $cv);
+        my $t  = AE::timer($self->time_left, 0, $cv)
             if $self->has_timeout;
         $cv->recv; # pause until unblocked or timed-out
     }
@@ -305,7 +314,7 @@ sub await_io {
             my $wvec = $mode ? $evec : undef;
             $! = 0;
             select $rvec, $wvec, $evec, $self->time_left;
-        } while $!{EINTR};
+        } while $!{EINTR} and $self->[SOCK]->opened;
     }
     #@! await_io done
     return;
@@ -320,7 +329,40 @@ Socket::Stream - Protocol-oriented IO for SOCK_STREAM sockets
 
 =head1 SYNOPSIS
 
-    #TODO
+    use Socket::Stream;
+    ($sock1, $sock2) = Socket::Stream::pair();
+    $sock = Socket::Stream::INET($host_port); # simple case
+    $sock = Socket::Steram::UNIX($name);      # simple case
+    $stream = Socket::Stream->new($sock)
+        ->delimiter($delim)
+        ->max_read($int)
+        ->timeout($duration)
+        ->on_recv_eof(sub { ... })
+        ->on_recv_err(sub { ... })
+        ->on_send_err(sub { ... });
+
+    # Send data
+    $success = $stream->send_msg(@messages);
+    $success = $stream->send_data(@strings);
+
+    # Receive data
+    $msg = $stream->recv_msg;
+    $msg = $stream->recv_msg_nb;
+    $data = $stream->recv_re($regex);
+    $data = $stream->recv_re_nb($regex);
+    $data = $stream->recv_data($n);
+    $data = $stream->recv_data_nb($n);
+
+    # Status
+    $status = $stream->recv_status;
+    $bool = $stream->buffer_full;
+    $size = $stream->buffer_used;
+    $size = $stream->buffer_free;
+    $bool = $stream->recv_eof;
+    $err = $stream->recv_err;
+    $bool = $stream->recv_end;
+    $bool = $stream->data_end;
+    $err = $stream->send_err;
 
 =head1 DESCRIPTION
 
@@ -365,7 +407,7 @@ required, but if it is present then all the "blocking" operations are
 executed in such a way that the main event loop runs while waiting.
 This also means that the "blocking" operations can't be called from
 within the event loop, such as from IO watchers: you will elecit a
-"recursive blocking wait attempted" exception if you do.
+"recursive blocking wait attempted" exception if you try.
 
 Similarly, the module uses L<Carp> to complain about incorrect usage
 or other fatal errors if it is already present in memory, falling back
@@ -391,7 +433,7 @@ SOCK_STREAM sockets, assuming your platform supports it.
 
 The module has a significant number of methods, but many of them are
 of lesser importance.  This documentation aims to describe the more
-important methods first.  Some grouping is performed to save space.
+important methods first.
 
 Note that many methods return "self" so that methods can be chained
 together in the form C<< $obj->do_this($x)->do_that($y) >>.  Objects
@@ -459,6 +501,13 @@ only applies to messages terminated by a delimiter or regex: if you
 specify data by size, the limit is temporarily adjusted to match the
 request.
 
+Note that the nonblocking variants aren't subject to timeouts because
+they always return immediately.  As such, they neither alter nor use
+the timeout timer.  This means you can use it independently if you
+want to manage an overall receive time limit: call L</"start_timer">,
+then nonblocking receives as required, testing L<"timer_expired"> as
+you go.  Note that send operations will also restart the timer.
+
 =head3 recv_msg
 
     $msg = $stream->recv_msg;
@@ -481,9 +530,9 @@ available yet.
 Blocks until a message terminated by a $regex match arrives.  Returns
 all data up to and including the part which matched the $regex.  The
 intended use is for messages which can't be delimited by a simple
-exact-string match, but more complex expressions are allowed.  If the
-$regex contains capture groups, they will still be available on
-return, but I recommend matching on the message terminator and leaving
+exact-string match, but more complex expressions are allowed.  Groups
+are permitted, but preservation of the group match variables is not
+guaranteed; I recommend matching on the message terminator and leaving
 more complex matching until later.  Undef is returned on error.
 
 =head3 recv_re_nb
@@ -491,7 +540,9 @@ more complex matching until later.  Undef is returned on error.
     $data = $stream->recv_re_nb($regex);
 
 As per L</"recv_re">, but returns undef immediately if matching data
-is not available yet.
+is not available yet.  Note that undef is associated with three cases:
+no data yet, EOF, and error.  Consult various L</"Status"> methods to
+distinguish between these cases.
 
 =head3 recv_data
 
@@ -506,7 +557,9 @@ this method never results in a message size error.
     $data = $stream->recv_data_nb($n);
 
 As per L</"recv_data">, but returns undef immediately if insufficient
-data is currently available.
+data is currently available.  Note that undef is associated with three
+cases: no data yet, EOF, and error.  Consult various L</"Status">
+methods to distinguish between these cases.
 
 =head2 Status
 
@@ -574,6 +627,15 @@ has occurred; undef otherwise.
 
 True if L</"recv_eof"> is true, or if L</"recv_err"> is defined.
 Either way, no more data will be received into the read buffer.
+
+=head3 data_end
+
+True if L</"recv_eof"> is true and the read buffer is empty, meaning
+that the stream was properly closed and all data was consumed.  Note
+that this condition isn't always reachable: if you're expecting a
+delimited message and the sender closes without sending the delimiter,
+then L</"recv_msg"> will fail (return undef) and L</"recv_eof"> will
+be true, but B<data_end> will still be false.
 
 =head3 send_err
 
@@ -680,7 +742,9 @@ True if L</"time_left"> is defined and zero or less.
 Blocks waiting for incoming data ($mode == 0) or outgoing write buffer
 space ($mode == 1) up to the limits of the current running timer (see
 above).  If L<AnyEvent> is loaded, the "blocking" is performed using a
-condition variable which allows the main event loop to run.
+condition variable which allows the main event loop to run.  There is
+no effect other than the possible blocking: no value is returned to
+indicate which condition was encountered, and no errors are raised.
 
 =head3 await_data
 
@@ -711,6 +775,11 @@ internally -- one of the benefits of using this module.  Interrupted
 calls are simply restarted, with appropriate adjustment to timeout
 values where applicable.  You won't see this error.
 
+If you actually want a signal to interrupt socket I/O in some way,
+you'll need to make it happen in a signal handler.  If you just want
+to abort all I/O in progress, closing the underlying socket will do
+the trick.
+
 =head2 EAGAIN, EWOULDBLOCK
 
 These errors are returned when requests for nonblocking operation
@@ -729,7 +798,8 @@ The "broken pipe" error occurs when sending data is no longer possible
 due to socket shutdown.  This is usually associated with the SIGPIPE
 signal, but this module uses several platform-specific techniques to
 prevent the signal.  The EPIPE error can instead be caught via the
-L</"on_send_err"> callback hook, as with any other send error.
+L</"on_send_err"> callback hook, as with any other send error.  Niche
+platforms may still require a SIGPIPE handler.
 
 =head2 EMSGSIZE
 
@@ -761,6 +831,13 @@ opportunity to consider whether to wait longer.  If you want to ask
 the user whether to keep waiting, use indefinite timeouts and manage
 your own timers.  You can always create a signal handler which shuts
 down the socket and send the signal at any time.
+
+=head2 EBADF
+
+You'll get this if you attempt to send or receive on a socket which
+has been closed locally, as opposed to remotely.  You can force-fail a
+stream by closing the socket.  This is a standard POSIX error, but you
+can compare it against Socket::Stream::EBADF() if you prefer.
 
 =head1 INHERITING
 
@@ -833,6 +910,13 @@ caught by C<< $stream->recv_status == 0 >>.
         "Exiting.";
     exit;
 
+=head2 RESP2 Client
+
+The module L<Socket::Stream::RESP2Client>, bundled with this one, is a
+good working example of a simple but real protocol.  RESP2 is used by
+Redis and other work-alike systems.  The module is not a full Redis
+API abstraction, but it could be used to implement one.
+
 =head1 THREAD SAFETY
 
 This module is not thread-safe, and the problem it aims to solve does
@@ -844,10 +928,14 @@ L<Thread::Queue> or similar.
 =head1 SEE ALSO
 
 L<AnyEvent> is the supported event loop provider.  I don't recommend
-using it in other event loop contexts.
+using this module in other event loop contexts.
 
 L<Time::Left> is used by this module to manage timeouts.  If you have
 additional time limits, you may find it useful.
+
+L<Socket::Stream::RESP2Client> uses this module to implement a RESP2
+client library.  It is useful both as an example and for simple Redis
+use cases.
 
 =head1 LICENSE AND COPYRIGHT
 
