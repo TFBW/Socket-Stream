@@ -27,6 +27,9 @@ assert_buffer_empty();
 $s1->send_msg('test');
 is($s2->recv_msg, 'test', "Single send_msg+recv_msg");
 assert_buffer_empty();
+$s1->send_msg('');
+is($s2->recv_msg, '', "Single send_msg+recv_msg with empty string");
+assert_buffer_empty();
 
 $s1->send_msg(qw(foo bar baz));
 is($s2->recv_msg_nb, $_, "Multi send_msg+recv_msg_nb ($_)")
@@ -41,10 +44,20 @@ $s1->send_data('A'..'Z');
 is($s2->recv_data_nb(26), join('', 'A'..'Z'), "Multi send_data+recv_data_nb");
 assert_buffer_empty();
 
-$s1->send_data('123X456Y');
+$s1->send_data('123;456;');
 is($s2->recv_re_nb(qr/A/), undef, 'Mismatch recv_re_nb');
-is($s2->recv_re(qr/X/), '123X', 'Match recv_re');
-is($s2->recv_re_nb(qr/Y/), '456Y', 'Match recv_re_nb');
+is($s2->recv_re(qr/\D/), '123;', 'Match recv_re');
+is($s2->recv_re_nb(qr/;/), '456;', 'Match recv_re_nb');
+assert_buffer_empty();
+
+$s1->send_data("Hello\x0D");
+$s2->use_CRLF;
+is($s2->recv_msg_nb, undef, "No msg on partial delimiter");
+$s1->send_data("\x0AWorld");
+is($s2->recv_msg_nb, 'Hello', "First msg complete");
+is($s2->recv_msg_nb, undef, "Second msg incomplete");
+$s1->send_data("!\x0D\x0A");
+is($s2->recv_msg_nb, 'World!', "Second msg complete");
 assert_buffer_empty();
 
 $s1->send_data('123456');
