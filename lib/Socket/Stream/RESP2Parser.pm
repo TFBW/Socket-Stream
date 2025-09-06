@@ -45,17 +45,19 @@ sub error { $_[0]->{error} }
 
 sub is_finished { !!($_[0]->{error} or @{$_[0]->{expect}} == 0) }
 
-our ($Stream, $Size, $Error, $Expect, $Data);
+our ($Stream, $Size, $Error, @Expect, @Data);
 sub _fail { ($Error) = @_; return -1 }
 sub receive {
     my ($self) = @_;
     # Aliasing trick: access object contents as package globals.
-    local (*Stream, *Size, *Error, *Expect, *Data)
-        = \(@$self{qw(stream size error expect data)});
+    # Done primarily for readability rather than performance.
+    local (*Stream, *Size, *Error) = \(@$self{qw(stream size error)});
     return -1 if $Error;
-    return 1 unless @$Expect;
+    local *Expect = $self->{expect}; # @Expect
+    return 1 unless @Expect;
+    local *Data = $self->{data}; # @Data
     my $datum;
-    while (@$Expect) {
+    while (@Expect) {
         if ($Size) {
             $datum = $Stream->recv_data_nb($Size);
             return 0 unless defined $datum;
@@ -77,17 +79,17 @@ sub receive {
             elsif ($msg =~ /\D/) { return _fail("invalid count '$msg'") }
             elsif ($type eq '$') { $Size = $msg + 2; next }
             elsif ($msg == 0) { $datum = [] }
-            else { push @$Data, []; push @$Expect, $msg; next }
+            else { push @Data, []; push @Expect, $msg; next }
         }
-        while (@$Expect) {
-            push @{$Data->[-1]}, $datum;
-            last if --$Expect->[-1] > 0;
+        while (@Expect) {
+            push @{$Data[-1]}, $datum;
+            last if --$Expect[-1] > 0;
             # Array filled: pop the zero and merge the array as datum.
-            pop @$Expect;
-            $datum = pop @$Data;
+            pop @Expect;
+            $datum = pop @Data;
         }
     }
-    $Data = $datum; # unwrap final result
+    $self->{data} = $datum; # unwrap final result
     return 1;
 }
 
@@ -113,10 +115,10 @@ Socket::Stream::RESP2Parser - Progressive RESP2 response parser
 
 This is a parser for RESP2 (Redis) server responses.  Server output is
 fed directly via a L<Socket::Stream> object, and only nonblocking IO
-methods are used.  It the entire response is not yet available in the
-stream, the object will hold the partial response and may continue
-where it left off once further data is available.  The parser has very
-low overhead and uses no recursion or closures.
+methods are used.  If the entire response is not yet available in the
+stream, the object can parse what's present and continue where it left
+off once further data arrives.  The parser has very low overhead and
+uses no recursion or closures.
 
 Only three methods are used on the underlying L<Socket::Stream>: the
 new() method invokes use_CRLF() on it to ensure that the appropriate
@@ -160,7 +162,7 @@ best approach for speed.
 
 Resets an existing object to expect $count new responses (default 1).
 This is effectively the same as creating a new object with the same
-stream but saves a little overhead.  Note that this does nothing to
+stream, but saves a little overhead.  Note that this does nothing to
 the underlying stream, and the operation only makes sense if the
 stream is still up, working, and between responses.
 
@@ -171,13 +173,13 @@ stream is still up, working, and between responses.
 Parses available data on the stream.  The returned $status is one of
 three values: 1 for complete and successful; 0 for incomplete; -1 for
 parser errors.  Once the method has returned a nonzero response, any
-further calls to the method do nothing and return the same value.  If
-the method returns zero, you should wait for the stream to be ready to
-read before calling again.  Monitoring the stream for errors is the
-caller's responsibility: this method does not distinguish between data
-not yet available and error/EOF conditions.  In the case of a parser
-error, the stream should be abandoned: there's no way to recover the
-session from such a condition.
+further calls to the method do nothing and return the same value until
+expect() is called.  If the method returns zero, you should wait for
+the stream to be ready to read before calling again.  Monitoring the
+stream for errors is the caller's responsibility: this method does not
+distinguish between data not yet available and error/EOF conditions.
+In the case of a parser error, the stream should be abandoned: there's
+no way to recover the session from such a state.
 
 =head2 data
 
