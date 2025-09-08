@@ -8,6 +8,7 @@ our $VERSION = '0.001';
 use if $ENV{DEBUG} => 'Debug::Comments';
 
 use Socket::Stream;
+use Socket::Stream::RESP2Parser;
 use Time::Left qw(time_left);
 
 use constant {
@@ -19,6 +20,7 @@ use constant {
 };
 
 sub _NOOP { }
+sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 # Arg is socket or host:port; default local Redis
 sub new {
@@ -57,53 +59,27 @@ sub request {
         );
 }
 
-sub _recv_msg {
-    my ($self, $n) = @_;
-    $self->[STREAM]->timeout($self->[TIMER]->remaining);
-    return defined($n) ?
-        $self->[STREAM]->recv_data($n) :
-        $self->[STREAM]->recv_msg;
-}
-
-sub _recv_datum {
+sub _await_data {
     my ($self) = @_;
-    my $data = $self->_recv_msg
-        or die "Empty message\n";
-    #@! Received msg '$data'
-    my $type = substr($data, 0, 1, '');
-    return $data  if $type eq '+' or $type eq ':';
-    return \$data if $type eq '-';
-    die "Unrecognised data type\n"
-        unless $type eq '$' or $type eq '*';
-    # Array/bulk string only beyond this point
-    return undef if $data eq '-1';
-    die "Invalid count '$data'\n"
-        if $data =~ /\D/;
-    my $n = $data;
-    if ($type eq '$') {
-        $data = $self->_recv_msg($n);
-        die "Bulk string parse error\n"
-            unless $self->_recv_msg eq '';
-    }
-    else {
-        #@! Start array size $n
-        $data = [];
-        push @$data, $self->_recv_datum # recurse
-            for 1..$n;
-        #@! End array size $n
-    }
-    return $data;
+    $self->[STREAM]->timeout($self->[TIMER]->remaining);
+    $self->[STREAM]->start_timer;
+    return $self->[STREAM]->await_data;
 }
 
 sub response {
-    my ($self) = @_;
+    my ($self, $count) = @_;
+    $count //= 1;
     die "Can't use response() while response_cb() requests in progress.\n"
         if defined $self->[PENDING];
     $self->[STREAM]->on_recv_err(sub { die "Recv error: $!\n" });
     $self->_start_timer;
-    my $data = $self->_recv_datum;
+    my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
+    until ($parser->receive) {
+        $self->_await_data
+            or die "Server closed connection\n";
+    }
     $self->[STREAM]->on_recv_err();
-    return $data;
+    return $parser->data_or_die;
 }
 
 sub call {
@@ -121,131 +97,71 @@ sub data_available {
 
 ### Receive data the hard way: non-blocking.
 
-# $okcb->() when ready to read socket; $ngcb->($reason) immediately if
-# recv stream has ended or time is up, later if timer expires.
-sub _io_cb {
-    my ($self, $okcb, $ngcb) = @_;
-    return $ngcb->("end of data")
-        if $self->[STREAM]->recv_eof;
-    return $ngcb->($self->[STREAM]->recv_err)
-        if $self->[STREAM]->recv_err;
-    return $ngcb->("too late to wait")
-        if $self->[TIMER]->expired;
-    my ($t, $w);
-    # $next keeps $t and $w alive until called
-    my $next = sub { undef $t; undef $w; shift->(@_) };
-    # $t and $w keep $next alive
-    $t = AE::timer($self->[TIMER]->remaining, 0, sub { $next->($ngcb, "timeout") })
-        if $self->[TIMER]->is_limited;
-    $w = AE::io($self->[SOCKET], 0, sub { $next->($okcb) });
-    return;
-}
-
-# $okcb->($data) when empty message received; $ngcb->($reason) when
-# non-empty message received or other error.
-sub _recv_empty_msg_cb {
-    my ($self, $data, $okcb, $ngcb) = @_;
-    my $msg = $self->[STREAM]->recv_msg_nb;
-    return $msg eq '' ? $okcb->($data) : $ngcb->("expected CRLF")
-        if defined $msg;
-    #@! Still awaiting bulk string terminator
-    return $self->_io_cb(
-        sub { $self->_recv_empty_msg_cb($data, $okcb, $ngcb) }, # retry
-        $ngcb,
-        );
-}
-
-# Reads $n bytes then passes to _recv_empty_msg_cb
-sub _recv_bulk_cb {
-    my ($self, $n, $okcb, $ngcb) = @_;
-    my $data = $self->[STREAM]->recv_data_nb($n);
-    return $self->_recv_empty_msg_cb($data, $okcb, $ngcb)
-        if defined $data;
-    #@! recv_bulk_cb got no data
-    return $self->_io_cb(
-        sub { $self->_recv_bulk_cb($n, $okcb, $ngcb) }, # retry
-        $ngcb,
-        );
-}
-
-# Uses _recv_datum_cb to push $n items into $array, then calls
-# $okcb->($array).
-sub _recv_array_cb {
-    my ($self, $n, $array, $okcb, $ngcb) = @_;
-    return $okcb->($array)
-        unless $n > 0;
-    return $self->_recv_datum_cb(
-        sub {
-            push @$array, $_[0];
-            $self->_recv_array_cb($n - 1, $array, $okcb, $ngcb);
-        },
-        $ngcb,
-        );
-}
-
-# Read one datum then call $okcb->($datum); may use _recv_array_cb or
-# _recv_bulk_cv.  Calls $ngcb->($reason) on error.
-sub _recv_datum_cb {
-    my ($self, $okcb, $ngcb) = @_;
-    my $data = $self->[STREAM]->recv_msg_nb;
-    if (defined $data) {
-        #@! get_datum_cb got '$data'
-        my $type = substr($data, 0, 1, '');
-        return $okcb->($data)
-            if $type eq '+' or $type eq ':';
-        return $okcb->(\$data)
-            if $type eq '-';
-        return $ngcb->("unrecognised data type")
-            unless $type eq '$' or $type eq '*';
-        return $okcb->(undef)
-            if $data eq '-1';
-        return $ngcb->("invalid count")
-            if $data =~ /\D/;
-        return $self->_recv_bulk_cb($data, $okcb, $ngcb)
-            if $type eq '$';
-        #@! Start array size $data
-        return $self->_recv_array_cb($data, [], $okcb, $ngcb);
-    }
-    #@! get_datum_cb got no data
-    return $self->_io_cb(
-        sub { $self->_recv_datum_cb($okcb, $ngcb) }, # retry
-        $ngcb,
-        );
-}
-
 sub _fail_pending {
     my ($self) = @_;
-    while (my $p = shift @{$self->[PENDING]}) {
-        $p->[1]->("");
-    }
+    while (my $p = shift @{$self->[PENDING]}) { $p->[1]->("") }
     undef $self->[PENDING];
     return;
 }
 
+# Call via _trampoline; returns continuation code (if any).  Wrap your
+# head around the _trampoline approach to continuation passing before
+# trying to read this code.  All the sub-subs are trampolined except
+# for the timer and watcher subs, which are called by the event loop.
 sub _next_pending {
     my ($self) = @_;
     if (@{$self->[PENDING]} == 0) {
         undef $self->[PENDING];
         return;
     }
-    my ($okcb, $ngcb) = @{shift @{$self->[PENDING]}};
+    my ($okcb, $ngcb, $count) = @{shift @{$self->[PENDING]}};
     $self->_start_timer;
-    return $self->_recv_datum_cb(
-        sub { $okcb->(@_); $self->_next_pending }, # recurse
-        sub { $ngcb->(@_); $self->_fail_pending },
-        );
+    my ($timer, $watcher, $resolve);
+    $resolve = sub { undef $timer; undef $watcher; return @_ };
+    my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
+    my $succeed = sub { $okcb->($parser->data); sub { $self->_next_pending } };
+    my $fail = sub { $ngcb->(@_); sub { $self->_fail_pending } };
+    my $receive = sub {
+        my $status = $parser->receive;
+        return
+            $status > 0 ? ($resolve, $succeed) :
+            $status < 0 ? ($resolve, $fail, $parser->error) :
+            ();
+    };
+    my @outcome = $receive->();
+    return @outcome if @outcome;
+    # Still here? We need to wait for data using AnyEvent.
+    $watcher = AE::io($self->[SOCKET], 0, sub {
+        if ($self->[STREAM]->recv_status == 0) {
+            my $error = $self->[STREAM]->recv_err || "connection closed";
+            return _trampoline($resolve, $fail, $error);
+        }
+        return _trampoline($receive->());
+                      });
+    $timer = AE::timer($self->[TIMER]->remaining, 0,
+                       sub { _trampoline($resolve, $fail, 'timeout') })
+        if $self->[TIMER]->is_limited;
+    return;
+}
+
+# Call code which optionally returns the next code and args to call.
+sub _trampoline {
+    my ($code, @args) = @_;
+    while ($code) { ($code, @args) = $code->(@args) } # boing!
+    return;
 }
 
 sub response_cb {
-    my ($self, $okcb, $ngcb) = @_;
+    my ($self, $okcb, $ngcb, $count) = @_;
     $okcb //= \&_NOOP;
     $ngcb //= \&_NOOP;
+    $count //= 1;
     if ($self->[PENDING]) {
-        push @{$self->[PENDING]}, [$okcb, $ngcb];
+        push @{$self->[PENDING]}, [$okcb, $ngcb, $count];
     }
     else {
-        $self->[PENDING] = [[$okcb, $ngcb]];
-        $self->_next_pending;
+        $self->[PENDING] = [[$okcb, $ngcb, $count]];
+        _trampoline(sub { $self->_next_pending });
     }
     return $self;
 }
@@ -312,13 +228,15 @@ send commands in the "inline" style if you want to.
 =head2 response
 
     $data = $client->response;
+    @data = $client->response($count);
 
-Blocks and waits for one response, returning it as Perl data.  RESP2
-has data models for arrays, null, and various scalars.  Arrays are
-returned as ARRAY refs; null is returned as undef; integers and
-strings are returned as scalars.  Error strings are returned as scalar
-references to distinguish them from normal strings.  An exception is
-raised if there is any kind of communications or protocol error.
+Blocks and waits for $count responses (default 1), returning them as
+Perl data.  If called in a scalar context, you get the first response.
+See L<Socket::Stream::RESP2Parser> for details on how RESP2 data is
+converted to Perl data, but the short version is that it's all done in
+the obvious way except for error strings which are converted to scalar
+references.  An exception is raised if there is any kind of protocol
+or communications error.
 
 =head2 call
 
@@ -328,16 +246,18 @@ Shortcut for C<< $data = $client->request(@args)->response; >>.
 
 =head2 response_cb
 
-    $client->response_cb($okcb, $ngcb);
+    $client->response_cb($okcb, $ngcb, $count);
 
-Asynchronous response handling: requires L<AnyEvent>.  The arguments
-are CODE references to call back in case of success ($okcb) or failure
-($ngcb).  If either is undef, it is considered a no-op, but you'll
-generally want both.  The module will call C<< $okcb->($data) >> with
-$data as per the response() method, or C<< $ngcb->($reason) >> with
-$reason as an error message.  The callback will happen immediately if
-possible; otherwise it will be called from the event loop when ready.
-The callbacks should be exception-free because of the event loop.
+Asynchronous response handling: requires L<AnyEvent>.  The first two
+arguments are CODE references to call back in case of success ($okcb)
+or failure ($ngcb).  If either is undef, it is considered a no-op, but
+you'll generally want both.  The $count argument is the number of
+responses to expect, as per response(), defaulting to 1.  The module
+will call C<< $okcb->(@data) >> with @data as per the response()
+method, or C<< $ngcb->($reason) >> with $reason as an error message.
+The callback will happen immediately if possible; otherwise it will be
+called from the event loop when ready.  The callbacks should be
+exception-free because of the event loop.
 
 It is possible to queue response_cb() handlers: calling response_cb()
 again before the previous one is complete results in the callbacks
