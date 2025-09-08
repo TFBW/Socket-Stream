@@ -112,9 +112,6 @@ sub _fail_pending {
     return;
 }
 
-# Call repeatedly until false; i.e. "1 while $self->_next_pending;".
-# The true return means a response was processed; false means no work
-# remains or the remaining work will be handled by an IO watcher.
 sub _next_pending {
     my ($self) = @_;
     while (@{$self->[PENDING]}) {
@@ -130,22 +127,22 @@ sub _next_pending {
             elsif ($done < 0) { $fail->($parser->error) }
         };
         $receive->();
-        return $done > 0
-            if $done;
+        next if $done > 0;
+        last if $done < 0;
         # Still here? We need to wait for data using AnyEvent.
         $watcher = AE::io($self->[SOCKET], 0, sub {
             $receive->();
-            if    ($done == 1) { 1 while $self->_next_pending }
+            if    ($done == 1) { $self->_next_pending }
             elsif ($done == 0 and $self->[STREAM]->recv_end) {
                 $fail->($self->[STREAM]->recv_err || "connection closed");
             }
                           });
         $timer = AE::timer($self->[TIMER]->remaining, 0, sub { $fail->('timeout') })
             if $self->[TIMER]->is_limited;
-        return 0;
+        return;
     }
     undef $self->[PENDING];
-    return 0;
+    return;
 }
 
 sub response_cb {
@@ -158,7 +155,7 @@ sub response_cb {
     }
     else {
         $self->[PENDING] = [[$okcb, $ngcb, $count]];
-        1 while $self->_next_pending;
+        $self->_next_pending;
     }
     return $self;
 }
