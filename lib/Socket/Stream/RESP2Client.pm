@@ -20,7 +20,6 @@ use constant {
 };
 
 sub _NOOP { }
-sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 # Arg is socket or host:port; default local Redis
 sub new {
@@ -69,8 +68,17 @@ sub _await_data {
 sub response {
     my ($self, $count) = @_;
     $count //= 1;
-    die "Can't use response() while response_cb() requests in progress.\n"
-        if defined $self->[PENDING];
+    if (defined $self->[PENDING]) {
+        # Convert to an async request and wait
+        my $cv = AE::cv();
+        my (@data, $error);
+        $self->response_cb(
+            sub { @data = @_;    $cv->send(1) },
+            sub { ($error) = @_; $cv->send(0) },
+            $count
+            );
+        return $cv->recv ? @data : die "Recv error: $error\n";
+    }
     $self->[STREAM]->on_recv_err(sub { die "Recv error: $!\n" });
     $self->_start_timer;
     my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
@@ -104,51 +112,40 @@ sub _fail_pending {
     return;
 }
 
-# Call via _trampoline; returns continuation code (if any).  Wrap your
-# head around the _trampoline approach to continuation passing before
-# trying to read this code.  All the sub-subs are trampolined except
-# for the timer and watcher subs, which are called by the event loop.
+# Call repeatedly until false; i.e. "1 while $self->_next_pending;".
+# The true return means a response was processed; false means no work
+# remains or the remaining work will be handled by an IO watcher.
 sub _next_pending {
     my ($self) = @_;
-    if (@{$self->[PENDING]} == 0) {
-        undef $self->[PENDING];
-        return;
+    while (@{$self->[PENDING]}) {
+        my ($okcb, $ngcb, $count) = @{shift @{$self->[PENDING]}};
+        $self->_start_timer;
+        my ($timer, $watcher, $receive, $done);
+        my $cleanup = sub { undef $timer; undef $watcher; undef $receive };
+        my $fail = sub { &$cleanup; $ngcb->(@_); $self->_fail_pending };
+        my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
+        $receive = sub {
+            $done = $parser->receive;
+            if    ($done > 0) { &$cleanup; $okcb->($parser->data) }
+            elsif ($done < 0) { $fail->($parser->error) }
+        };
+        $receive->();
+        return $done > 0
+            if $done;
+        # Still here? We need to wait for data using AnyEvent.
+        $watcher = AE::io($self->[SOCKET], 0, sub {
+            $receive->();
+            if    ($done == 1) { 1 while $self->_next_pending }
+            elsif ($done == 0 and $self->[STREAM]->recv_end) {
+                $fail->($self->[STREAM]->recv_err || "connection closed");
+            }
+                          });
+        $timer = AE::timer($self->[TIMER]->remaining, 0, sub { $fail->('timeout') })
+            if $self->[TIMER]->is_limited;
+        return 0;
     }
-    my ($okcb, $ngcb, $count) = @{shift @{$self->[PENDING]}};
-    $self->_start_timer;
-    my ($timer, $watcher, $resolve);
-    $resolve = sub { undef $timer; undef $watcher; return @_ };
-    my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
-    my $succeed = sub { $okcb->($parser->data); sub { $self->_next_pending } };
-    my $fail = sub { $ngcb->(@_); sub { $self->_fail_pending } };
-    my $receive = sub {
-        my $status = $parser->receive;
-        return
-            $status > 0 ? ($resolve, $succeed) :
-            $status < 0 ? ($resolve, $fail, $parser->error) :
-            ();
-    };
-    my @outcome = $receive->();
-    return @outcome if @outcome;
-    # Still here? We need to wait for data using AnyEvent.
-    $watcher = AE::io($self->[SOCKET], 0, sub {
-        if ($self->[STREAM]->recv_status == 0) {
-            my $error = $self->[STREAM]->recv_err || "connection closed";
-            return _trampoline($resolve, $fail, $error);
-        }
-        return _trampoline($receive->());
-                      });
-    $timer = AE::timer($self->[TIMER]->remaining, 0,
-                       sub { _trampoline($resolve, $fail, 'timeout') })
-        if $self->[TIMER]->is_limited;
-    return;
-}
-
-# Call code which optionally returns the next code and args to call.
-sub _trampoline {
-    my ($code, @args) = @_;
-    while ($code) { ($code, @args) = $code->(@args) } # boing!
-    return;
+    undef $self->[PENDING];
+    return 0;
 }
 
 sub response_cb {
@@ -161,7 +158,7 @@ sub response_cb {
     }
     else {
         $self->[PENDING] = [[$okcb, $ngcb, $count]];
-        _trampoline(sub { $self->_next_pending });
+        1 while $self->_next_pending;
     }
     return $self;
 }
@@ -256,8 +253,8 @@ responses to expect, as per response(), defaulting to 1.  The module
 will call C<< $okcb->(@data) >> with @data as per the response()
 method, or C<< $ngcb->($reason) >> with $reason as an error message.
 The callback will happen immediately if possible; otherwise it will be
-called from the event loop when ready.  The callbacks should be
-exception-free because of the event loop.
+called from the IO watcher when ready.  Callbacks should avoid raising
+any exceptions because their handling is unspecified.
 
 It is possible to queue response_cb() handlers: calling response_cb()
 again before the previous one is complete results in the callbacks
@@ -265,8 +262,8 @@ being placed in a queue.  If any response results in a failure, any
 remaining items in the queue are failed immediately with empty string
 as the reason.
 
-Calls to response() are not permitted while response_cb() operations
-are in progress.
+The response() method can be called while response_cb() operations are
+in progress: it will block until all pending responses are received.
 
 =head2 timeout
 
