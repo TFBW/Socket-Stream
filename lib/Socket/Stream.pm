@@ -142,7 +142,7 @@ sub set_send_err { $_[0]->_handle_cb(SERR, ON_SERR, $_[1]) }
 
 sub recv_eof { $_[0][EOF]  }
 sub recv_err { $_[0][RERR] }
-sub recv_end { !!($_[0][EOF] || $_[0][RERR]) }
+sub recv_end { $_[0][RERR] || ($_[0][EOF] && "connection closed") || '' }
 sub send_err { $_[0][SERR] }
 sub data_end { length($_[0][RECV]) == 0 && $_[0][EOF] }
 
@@ -626,7 +626,9 @@ has occurred; undef otherwise.
 =head3 recv_end
 
 True if L</"recv_eof"> is true, or if L</"recv_err"> is defined.
-Either way, no more data will be received into the read buffer.
+Either way, no more data will be received into the read buffer.  The
+string context of the value is an error message if the cause is an
+error, "connection closed" for EOF, empty string for false.
 
 =head3 data_end
 
@@ -688,6 +690,9 @@ there's no need to keep the callback around, and it means that any
 closure resources are freed up at that time.  Avoid reference to the
 $stream object in the closure, since that's circular, but direct
 reference to the underlying socket is safe if needed.
+
+You can remove an existing hook by calling the relevant method with no
+arguments or undef.
 
 =head3 on_recv_eof
 
