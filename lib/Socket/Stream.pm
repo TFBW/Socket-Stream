@@ -145,7 +145,7 @@ sub recv_eof { $_[0][EOF]  }
 sub recv_err { $_[0][RERR] }
 sub recv_end { $_[0][RERR] || ($_[0][EOF] && "connection closed") || '' }
 sub send_err { $_[0][SERR] }
-sub data_end { length($_[0][RECV]) == $_[0][START] && $_[0][EOF] }
+sub data_end { $_[0][EOF] and length($_[0][RECV]) == $_[0][START] }
 
 sub send_msg {
     my $self = shift;
@@ -160,31 +160,31 @@ sub send_data {
         return;
     }
     my $data = join('', @_);
-    return if $data eq '';
+    return 1 if $data eq ''; # send nothing
     my $n;
     #@! Quick send @{[length $data]} bytes
     $! = 0;
-    if ($n = send($self->[SOCK], $data, MSG_NOSIGNAL)) {
+    if ($n = send($self->[SOCK], $data, MSG_NOSIGNAL) // 0) {
         return 1 if $n == length($data); # that was easy
-        substr($data, 0, $n, '');        # more to go
     }
     elsif ($! and not BLOCKED and not $!{EINTR}) {
         $self->set_send_err($!); # fast fail
         return;
     }
-    #@! Slow send @{[length $data]} remaining bytes
+    #@! Slow send @{[length($data)-$n]} remaining bytes
     $self->start_timer;
-    until ($data eq '' or $self->timer_expired) {
+    my $m;
+    until ($n == length($data) or $self->timer_expired) {
         $self->await_io(1);
         do {
             $! = 0;
-            $n = send($self->[SOCK], $data, MSG_NOSIGNAL);
-        } while !$n && $!{EINTR};
-        if ($n) { substr($data, 0, $n, '') }
-        elsif (not BLOCKED) { $data = ''; $self->set_send_err($!) }
-        #@! @{[length $data]} remaining bytes
+            $m = send($self->[SOCK], substr($data, $n), MSG_NOSIGNAL);
+        } while !$m && $!{EINTR};
+        if ($m) { $n += $m }
+        elsif (not BLOCKED) { $self->set_send_err($!); return }
+        #@! @{[length($data)-$n]} remaining bytes
     }
-    if ($data ne '') { $self->set_send_err($! = ETIMEDOUT); return }
+    if ($n != length($data)) { $self->set_send_err($! = ETIMEDOUT); return }
     #@! Send complete
     return 1;
 }
@@ -258,7 +258,8 @@ sub recv_re_nb {
 
 sub recv_data {
     my ($self, $n) = @_;
-    local $self->[MAX_READ] = $n; # temporarily raise/lower limit
+    local $self->[MAX_READ] = $n
+        if $n > $self->[MAX_READ];
     $self->start_timer;
     while ($self->buffer_used < $n) {
         $self->await_data
@@ -269,7 +270,8 @@ sub recv_data {
 
 sub recv_data_nb {
     my ($self, $n) = @_;
-    local $self->[MAX_READ] = $n; # temporarily raise/lower limit
+    local $self->[MAX_READ] = $n
+        if $n > $self->[MAX_READ];
     while ($self->buffer_used < $n) {
         last unless $self->recv_status > 0;
     }
@@ -567,8 +569,9 @@ distinguish between these cases.
     $data = $stream->recv_data($n);
 
 Blocks until $n bytes of data have arrived, returning those bytes or
-undef on failure.  The message size limit is temporarily set to $n, so
-this method never results in a message size error.
+undef on failure.  The message size limit is temporarily set to $n if
+it exceeds L</"max_read">, so this method never results in a message
+size error.
 
 =head3 recv_data_nb
 
@@ -643,10 +646,12 @@ has occurred; undef otherwise.
 
 =head3 recv_end
 
-True if L</"recv_eof"> is true, or if L</"recv_err"> is defined.
-Either way, no more data will be received into the read buffer.  The
-string context of the value is an error message if the cause is an
-error, "connection closed" for EOF, empty string for false.
+A string with boolean significance, giving the reason why the receive
+stream has ended.  If L</"recv_eof"> is true, this is "connection
+closed"; if L</"recv_err"> is defined, this is the associated error
+message.  Either way, no more data will be received into the read
+buffer.  If neither of these conditions apply, the receive stream is
+still active, and this returns an empty string (false).
 
 =head3 data_end
 
