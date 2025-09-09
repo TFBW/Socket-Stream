@@ -13,8 +13,8 @@ sub new {
 }
 
 # Note that the 'expect' and 'data' fields are initialised as though
-# the object were told that an array of $expect elements follows.
-# There is a final "unwrap" at the end of receive() which promotes the
+# the object were told that an array of size $expect follows.  There
+# is a final "unwrap" at the end of receive() which promotes the
 # accumulated contents to the top level to save the extra drill-down
 # when accessing the final result.
 sub expect {
@@ -41,7 +41,7 @@ sub data_or_die {
     return $self->data;
 }
 
-sub error { $_[0]->{error} }
+sub error { @_ == 1 ? $_[0]->{error} : do { $_[0]->{error} = $_[1]; $_[0] } }
 
 sub is_finished { !!($_[0]->{error} or @{$_[0]->{expect}} == 0) }
 
@@ -204,10 +204,12 @@ vanilla die() if not.
 =head2 error
 
     $error = $parser->error;
+    $parser = $parser->error($string);
 
-Returns the parser error string if such an error has occurred, or the
-empty string otherwise.  Valid for use in boolean context to detect
-parser failures.
+With no argument, returns the parser error string if such an error has
+occurred, or the empty string otherwise.  Valid for use in a boolean
+context to detect parser failures.  With one argument, sets an error
+$string, which one might use to convey an IO error.
 
 =head2 is_finished
 
