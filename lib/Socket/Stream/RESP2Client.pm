@@ -5,8 +5,6 @@ use warnings;
 package Socket::Stream::RESP2Client;
 our $VERSION = '0.001';
 
-use if $ENV{DEBUG} => 'Debug::Comments';
-
 use Socket::Stream;
 use Socket::Stream::RESP2Parser;
 use Time::Left qw(time_left);
@@ -17,6 +15,7 @@ use constant {
     TIMEOUT => 2,
     TIMER   => 3,
     PENDING => 4,
+    _EXTEND => 5, # for inheritance
 };
 
 sub _NOOP { }
@@ -45,7 +44,8 @@ sub _start_timer { $_[0][TIMER] = time_left($_[0][TIMEOUT]) }
 sub request_raw {
     my $self = shift;
     $self->[STREAM]->timeout($self->[TIMEOUT]);
-    $self->[STREAM]->send_msg(@_);
+    $self->[STREAM]->send_msg(@_)
+        or die "Can't send request: $!\n";
     return $self;
 }
 
@@ -58,45 +58,32 @@ sub request {
         );
 }
 
-sub _await_data {
-    my ($self) = @_;
-    $self->[STREAM]->timeout($self->[TIMER]->remaining);
-    $self->[STREAM]->start_timer;
-    return $self->[STREAM]->await_data;
-}
-
 sub response {
     my ($self, $count) = @_;
     $count //= 1;
     if (defined $self->[PENDING]) {
         # Convert to an async request and wait
         my $cv = AE::cv();
-        my (@data, $error);
-        $self->response_cb(
-            sub { @data = @_;    $cv->send(1) },
-            sub { ($error) = @_; $cv->send(0) },
-            $count
-            );
-        return $cv->recv ? @data : die "Recv error: $error\n";
+        $self->response_cb($cv, $count);
+        return $cv->recv;
     }
-    $self->[STREAM]->on_recv_err(sub { die "Recv error: $!\n" });
     $self->_start_timer;
-    my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
+    my $stream = $self->[STREAM];
+    my $parser = Socket::Stream::RESP2Parser->new($stream, $count);
     until ($parser->receive) {
-        $self->_await_data
-            or die "Server closed connection\n";
+        $stream->timeout($self->[TIMER]->remaining);
+        $stream->start_timer;
+        next if $stream->await_data;
+        $parser->error($stream->recv_end);
     }
-    $self->[STREAM]->on_recv_err();
-    return $parser->data_or_die;
+    return $parser;
 }
 
 sub call {
     my $self = shift;
-    return $self->request(@_)->response;
+    return $self->request(@_)->response->data_or_die;
 }
 
-# Returns a byte count, but works as a boolean too, as in
-# $datum = $self->response if $self->data_available;
 sub data_available {
     my ($self) = @_;
     $self->[STREAM]->recv_status; # obtain data if available
@@ -107,7 +94,12 @@ sub data_available {
 
 sub _fail_pending {
     my ($self) = @_;
-    while (my $p = shift @{$self->[PENDING]}) { $p->[1]->("") }
+    while (my $p = shift @{$self->[PENDING]}) {
+        my $parser = Socket::Stream::RESP2Parser
+            ->new($self->[STREAM], $p->[1])
+            ->error('aborted');
+        $p->[0]->($parser);
+    }
     undef $self->[PENDING];
     return;
 }
@@ -115,29 +107,26 @@ sub _fail_pending {
 sub _next_pending {
     my ($self) = @_;
     while (@{$self->[PENDING]}) {
-        my ($okcb, $ngcb, $count) = @{shift @{$self->[PENDING]}};
+        my ($cb, $count) = @{shift @{$self->[PENDING]}};
         $self->_start_timer;
-        my ($timer, $watcher, $receive, $done);
-        my $cleanup = sub { undef $timer; undef $watcher; undef $receive };
-        my $fail = sub { &$cleanup; $ngcb->(@_); $self->_fail_pending };
         my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
-        $receive = sub {
-            $done = $parser->receive;
-            if    ($done > 0) { &$cleanup; $okcb->($parser->data) }
-            elsif ($done < 0) { $fail->($parser->error) }
-        };
+        my ($timer, $watcher, $done);
+        my $finish = sub { undef $timer; undef $watcher; $cb->($parser) };
+        my $fail = sub { $parser->error(@_); &$finish };
+        my $receive = sub { $done = $parser->receive; &$finish if $done };
         $receive->();
         next if $done > 0;
-        last if $done < 0;
+        return $self->_fail_pending if $done < 0;
         # Still here? We need to wait for data using AnyEvent.
         $watcher = AE::io($self->[SOCKET], 0, sub {
             $receive->();
-            if    ($done == 1) { $self->_next_pending }
-            elsif ($done == 0 and $self->[STREAM]->recv_end) {
-                $fail->($self->[STREAM]->recv_err || "connection closed");
-            }
+            return if not $done and not $self->[STREAM]->recv_end; # continue
+            return $self->_next_pending if $done > 0;              # success
+            $fail->($self->_recv_err) unless $done;
+            return $self->_fail_pending;
                           });
-        $timer = AE::timer($self->[TIMER]->remaining, 0, sub { $fail->('timeout') })
+        $timer = AE::timer($self->[TIMER]->remaining, 0,
+                           sub { $fail->('timeout'); $self->_fail_pending })
             if $self->[TIMER]->is_limited;
         return;
     }
@@ -146,15 +135,14 @@ sub _next_pending {
 }
 
 sub response_cb {
-    my ($self, $okcb, $ngcb, $count) = @_;
-    $okcb //= \&_NOOP;
-    $ngcb //= \&_NOOP;
+    my ($self, $cb, $count) = @_;
+    $cb //= \&_NOOP;
     $count //= 1;
     if ($self->[PENDING]) {
-        push @{$self->[PENDING]}, [$okcb, $ngcb, $count];
+        push @{$self->[PENDING]}, [$cb, $count];
     }
     else {
-        $self->[PENDING] = [[$okcb, $ngcb, $count]];
+        $self->[PENDING] = [[$cb, $count]];
         $self->_next_pending;
     }
     return $self;
@@ -174,9 +162,9 @@ TODO
 =head1 DESCRIPTION
 
 This is a simple low-level RESP2 (Redis) client interface based around
-L<Socket::Stream>.  It is low-level in that is has no knowledge of any
-Redis commands, only the RESP2 protocol which communicates commands
-and responses.
+L<Socket::Stream> and L<Socket::Stream::RESP2Parser>.  It is low-level
+in that is has no knowledge of any Redis commands, only the RESP2
+protocol which communicates commands and responses.
 
 Requests are always sent synchronously; responses may be received
 synchronously or, with L<AnyEvent>, asynchronously.  One distinctive
@@ -206,58 +194,54 @@ exception is raised if socket connection fails.
     $client = $client->request(@args);
 
 Sends a request to the server in the usual "array of bulk strings"
-style.  The contents of @args should be byte-strings: any strings
-which may contain wide chars should be converted before sending.
-Blocking IO is used, but the event loop will run while waiting if
-L<AnyEvent> is in use.
+style or dies trying.  The contents of @args should be byte-strings:
+any strings which may contain wide chars should be converted before
+sending.  Blocking IO is used, but the event loop will run while
+waiting if L<AnyEvent> is in use.
 
 =head2 request_raw
 
     $client = $client->request_raw(@strings);
 
-Sends one or more @strings, each followed by CRLF, to the server.  The
-request() method is written in terms of this, but you can use it to
-send commands in the "inline" style if you want to.
+Sends one or more @strings, each followed by CRLF, to the server, or
+dies trying.  The request() method is written in terms of this, but
+you can use it to send commands in the "inline" style if you want to.
 
 =head2 response
 
-    $data = $client->response;
-    @data = $client->response($count);
+    $parser = $client->response($count);
 
-Blocks and waits for $count responses (default 1), returning them as
-Perl data.  If called in a scalar context, you get the first response.
-See L<Socket::Stream::RESP2Parser> for details on how RESP2 data is
-converted to Perl data, but the short version is that it's all done in
-the obvious way except for error strings which are converted to scalar
-references.  An exception is raised if there is any kind of protocol
-or communications error.
+Blocks and waits for $count responses (default 1), returning the
+L<Socket::Stream::RESP2Parser> object which received the responses.
+Refer to that class for details on the parsing process, how to tell if
+the process was successful, and how to access the data if it was.  Any
+IO error encountered becomes an error condition on the $parser object.
 
 =head2 call
 
     $data = $client->call(@args);
 
-Shortcut for C<< $data = $client->request(@args)->response; >>.
+Sends @args as a request, waits for the response, and returns the
+$data or raises an exception if an error prevents this.
 
 =head2 response_cb
 
-    $client->response_cb($okcb, $ngcb, $count);
+    $client = $client->response_cb($code, $count);
 
-Asynchronous response handling: requires L<AnyEvent>.  The first two
-arguments are CODE references to call back in case of success ($okcb)
-or failure ($ngcb).  If either is undef, it is considered a no-op, but
-you'll generally want both.  The $count argument is the number of
-responses to expect, as per response(), defaulting to 1.  The module
-will call C<< $okcb->(@data) >> with @data as per the response()
-method, or C<< $ngcb->($reason) >> with $reason as an error message.
-The callback will happen immediately if possible; otherwise it will be
-called from the IO watcher when ready.  Callbacks should avoid raising
-any exceptions because their handling is unspecified.
+Asynchronous response handling: only available if you have loaded the
+L<AnyEvent> module.  Differs from response() in that it does not block
+and delivers the L<Socket::Stream::RESP2Parser> object as an argument
+to the $code callback (i.e. C<< $code->($parser) >>) when parsing is
+complete.  The callback will happen immediately (inside the method) if
+possible, otherwise it will be called from an IO watcher when ready.
+The IO watcher context puts restrictions on what the callback may do:
+in particular it should not block or die.
 
 It is possible to queue response_cb() handlers: calling response_cb()
 again before the previous one is complete results in the callbacks
-being placed in a queue.  If any response results in a failure, any
-remaining items in the queue are failed immediately with empty string
-as the reason.
+being placed in a queue.  If any response results in a failure, all
+remaining items in the queue are called back immediately with a parser
+object in an "aborted" error state, as recovery is not possible.
 
 The response() method can be called while response_cb() operations are
 in progress: it will block until all pending responses are received.
@@ -292,4 +276,13 @@ then call response().
 
 Provides access to the socket created at new().  If a connected socket
 was provided at new(), this returns the same socket.
+
+=head1 ERRORS
+
+If a request or response method fails for any reason, consider the
+whole RESP2 session failed beyond recovery.  You will need to start
+from scratch with a new client object and socket if you want to
+perform further operations.  Long-running applications should always
+remain aware that servers need to restart occasionally, so loss of
+connectivity should be handled gracefully.
 
