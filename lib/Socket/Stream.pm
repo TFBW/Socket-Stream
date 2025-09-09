@@ -39,6 +39,7 @@ use constant do {
         RERR
         SERR
         SOCK
+        START
         TIMEOUT
         TIMER
         VEC
@@ -88,8 +89,8 @@ sub new {
         if SO_NOSIGPIPE; # avoid SIGPIPE if possible
     my $self = bless([], ref($class)||$class);
     vec(my $vec = '', fileno($sock), 1) = 1; # for select()
-    @$self[SOCK,  RECV, VEC,  DELIM, MAX_READ,        ]
-        = ($sock, '',   $vec, "\n",  DEFAULT_MAX_READ,);
+    @$self[SOCK,  RECV, VEC,  DELIM, START, MAX_READ,        ]
+        = ($sock, '',   $vec, "\n",  0,     DEFAULT_MAX_READ,);
     $self->start_timer; # populate TIMER
     return $self;
 }
@@ -100,9 +101,9 @@ sub delimiter { @_ == 1 ? $_[0][DELIM] : do { $_[0][DELIM] = $_[1]; $_[0] } }
 sub use_CRLF  { $_[0][DELIM] = "\x0D\x0A"; $_[0] }
 
 sub max_read    { @_ == 1 ? $_[0][MAX_READ] : do { $_[0][MAX_READ] = $_[1]; $_[0] } }
-sub buffer_full { length($_[0][RECV]) >= $_[0][MAX_READ] }
-sub buffer_used { length $_[0][RECV] }
-sub buffer_free { $_[0][MAX_READ] - length($_[0][RECV]) }
+sub buffer_full { length($_[0][RECV]) >= $_[0][MAX_READ] + $_[0][START] }
+sub buffer_used { length($_[0][RECV]) - $_[0][START] }
+sub buffer_free { $_[0][MAX_READ] - length($_[0][RECV]) + $_[0][START] }
 
 # Accessor with to_seconds conversion
 sub timeout {
@@ -144,7 +145,7 @@ sub recv_eof { $_[0][EOF]  }
 sub recv_err { $_[0][RERR] }
 sub recv_end { $_[0][RERR] || ($_[0][EOF] && "connection closed") || '' }
 sub send_err { $_[0][SERR] }
-sub data_end { length($_[0][RECV]) == 0 && $_[0][EOF] }
+sub data_end { length($_[0][RECV]) == $_[0][START] && $_[0][EOF] }
 
 sub send_msg {
     my $self = shift;
@@ -188,74 +189,91 @@ sub send_data {
     return 1;
 }
 
+# Note that the general receive buffer philosophy is as follows:
+# always try to find your message in the buffer first; if that fails,
+# use recv_status() or await_data() to obtain more and retry.  Copy
+# from the buffer freely, but modify it only when adding data.  This
+# is MUCH more efficient than splicing out the data you want.
+
+sub _take_msg {
+    my ($self, $n) = @_;
+    my $start = $self->[START];
+    $self->[START] += $n + length($self->[DELIM]);
+    return substr($self->[RECV], $start, $n);
+}
+
 sub recv_msg {
     my ($self) = @_;
     my $n;
     $self->start_timer;
-    while (($n = index($self->[RECV], $self->[DELIM])) < 0) {
+    while (($n = index($self->[RECV], $self->[DELIM], $self->[START])) < 0) {
         $self->await_data
             or return undef;
     }
-    return $self->_take_msg($n);
+    return $self->_take_msg($n - $self->[START]);
 }
 
 sub recv_msg_nb {
     my ($self) = @_;
-    $self->recv_status; # read what you can
-    my $n = index($self->[RECV], $self->[DELIM]);
-    return $self->_take_msg($n)
-        if $n >= 0;
+    my $n;
+    while (($n = index($self->[RECV], $self->[DELIM], $self->[START])) < 0) {
+        last unless $self->recv_status > 0;
+    }
+    return $self->_take_msg($n - $self->[START])
+        unless $n < 0;
     $self->set_recv_err($! = EMSGSIZE)
         if $self->buffer_full;
     return;
 }
 
-# Extract and trim delimited message from RECV buffer.
-sub _take_msg {
+sub _take {
     my ($self, $n) = @_;
-    my $dl = length($self->[DELIM]);
-    my $msg = substr($self->[RECV], 0, $n + $dl, '');
-    substr($msg, -$dl, $dl, ''); # trim DELIM
-    return $msg;
+    my $start = $self->[START];
+    $self->[START] += $n;
+    return substr($self->[RECV], $start, $n);
 }
 
 sub recv_re {
     my ($self, $re) = @_;
     $self->start_timer;
-    for ($self->[RECV]) {
-        until (/$re/g) { $self->await_data or return undef }
-        return substr($_, 0, pos($_), '');
+    pos($self->[RECV]) = $self->[START];
+    until ($self->[RECV] =~ /$re/gc) {
+        $self->await_data
+            or return undef;
     }
+    return $self->_take(pos($self->[RECV]) - $self->[START])
 }
 
 sub recv_re_nb {
     my ($self, $re) = @_;
-    $self->recv_status; # read what you can
-    for ($self->[RECV]) {
-        if (/$re/g) { return substr($_, 0, pos($_), '') }
+    pos($self->[RECV]) = $self->[START];
+    until ($self->[RECV] =~ /$re/gc) {
+        next if $self->recv_status > 0;
+        $self->set_recv_err($! = EMSGSIZE)
+            if $self->buffer_full;
+        return;
     }
-    $self->set_recv_err($! = EMSGSIZE)
-        if $self->buffer_full;
-    return;
+    return $self->_take(pos($self->[RECV]) - $self->[START])
 }
 
 sub recv_data {
     my ($self, $n) = @_;
     local $self->[MAX_READ] = $n; # temporarily raise/lower limit
     $self->start_timer;
-    while (length($self->[RECV]) < $n) {
+    while ($self->buffer_used < $n) {
         $self->await_data
             or return undef;
     }
-    return substr($self->[RECV], 0, $n, '');
+    return $self->_take($n);
 }
 
 sub recv_data_nb {
     my ($self, $n) = @_;
     local $self->[MAX_READ] = $n; # temporarily raise/lower limit
-    $self->recv_status; # read what you can
-    return if length($self->[RECV]) < $n;
-    return substr($self->[RECV], 0, $n, '');
+    while ($self->buffer_used < $n) {
+        last unless $self->recv_status > 0;
+    }
+    return $self->buffer_used < $n ? undef : $self->_take($n);
 }
 
 sub recv_status {
@@ -266,8 +284,7 @@ sub recv_status {
         return 0;
     }
     my $n = $self->buffer_free;
-    return -2 if $n <= 0;
-    $n = 0 if $n < 0;
+    return -2 unless $n > 0;
     #@! Room for $n bytes
     my $recv;
     do {
@@ -278,7 +295,8 @@ sub recv_status {
     if (    $!     ) { $self->set_recv_err($!); return 0 }
     if ($recv eq '') { $self->set_recv_eof;     return 0 }
     #@! Received @{[length $recv]} bytes
-    $self->[RECV] .= $recv;
+    $self->[RECV] = substr($self->[RECV], $self->[START]).$recv;
+    $self->[START] = 0;
     return length($recv);
 }
 
@@ -332,7 +350,7 @@ Socket::Stream - Protocol-oriented IO for SOCK_STREAM sockets
     use Socket::Stream;
     ($sock1, $sock2) = Socket::Stream::pair();
     $sock = Socket::Stream::INET($host_port); # simple case
-    $sock = Socket::Steram::UNIX($name);      # simple case
+    $sock = Socket::Stream::UNIX($name);      # simple case
     $stream = Socket::Stream->new($sock)
         ->delimiter($delim)
         ->max_read($int)
@@ -360,7 +378,7 @@ Socket::Stream - Protocol-oriented IO for SOCK_STREAM sockets
     $size = $stream->buffer_free;
     $bool = $stream->recv_eof;
     $err = $stream->recv_err;
-    $bool = $stream->recv_end;
+    $bool = $stream->recv_end; # also string
     $bool = $stream->data_end;
     $err = $stream->send_err;
 
