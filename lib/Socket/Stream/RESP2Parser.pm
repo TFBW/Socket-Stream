@@ -4,6 +4,14 @@ use warnings;
 
 package Socket::Stream::RESP2Parser;
 
+use constant {
+    STR   => ord '+',
+    ERR   => ord '-',
+    INT   => ord ':',
+    BULK  => ord '$',
+    ARRAY => ord '*',
+};
+
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 sub new {
@@ -59,7 +67,7 @@ sub receive {
     local *Expect = $self->{expect}; # @Expect
     return 1 unless @Expect;
     local *Data = $self->{data}; # @Data
-    my $datum;
+    my ($datum, $msg, $type, $val);
     while (@Expect) {
         if ($Size) {
             $datum = $Stream->recv_data_nb($Size);
@@ -69,19 +77,24 @@ sub receive {
             $Size = 0;
         }
         else {
-            my $msg = $Stream->recv_msg_nb;
+            $msg = $Stream->recv_msg_nb;
             return 0 unless defined $msg;
             next if $msg eq ''; # skip "blank lines"
-            my $type = substr($msg, 0, 1, '');
-            if ($type eq '+' or $type eq ':') { $datum = $msg }
-            elsif ($type eq '-') { $datum = \$msg }
-            elsif ($type ne '$' and $type ne '*') { return _fail("bad data type '$type'") }
+            $type = ord($msg);
+            $val = substr($msg, 1);
+            if ($type == STR or $type == INT) { $datum = $val }
+            elsif ($type == ERR) { $datum = \(my $err = $val) }
+            elsif ($type != BULK and $type != ARRAY) {
+                return _fail("bad message type '$msg'")
+                    unless $msg =~ /^[a-z]/i;
+                $datum = [ $msg =~ /\S+/g ]; # "inline" command
+            }
             # Is bulk string or array at this point
-            elsif ($msg eq '-1') { undef $datum }
-            elsif ($msg =~ /\D/) { return _fail("invalid count '$msg'") }
-            elsif ($type eq '$') { $Size = $msg + 2; next }
-            elsif ($msg == 0) { $datum = [] }
-            else { push @Data, []; push @Expect, $msg; next }
+            elsif ($val eq '-1') { undef $datum }
+            elsif ($val =~ /\D/) { return _fail("invalid count '$val'") }
+            elsif ($type == BULK) { $Size = $val + 2; next }
+            elsif ($val == 0) { $datum = [] }
+            else { push @Data, []; push @Expect, $val; next }
         }
         while (@Expect) {
             push @{$Data[-1]}, $datum;
