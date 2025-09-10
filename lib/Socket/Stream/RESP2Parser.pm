@@ -21,8 +21,11 @@ sub expect {
     my ($self, $expect) = @_;
     $expect //= 1;
     _die("Invalid response count '$expect'")
-        unless $expect =~ /^[1-9]\d*$/;
-    @$self{qw(size error expect data)} = (0, '', [$expect], [ [] ]);
+        unless $expect =~ /^\d+$/;
+    @$self{qw(size error expect data)} =
+        $expect > 0 ?
+        (0, '', [$expect], [ [] ]) :
+        (0, '', [], []);
     return $self;
 }
 
@@ -36,9 +39,9 @@ sub data_or_die {
     my ($self) = @_;
     _die("Parser error ($self->{error})")
         if $self->{error};
-    _die("Parsing incomplete")
+    _die("Response incomplete")
         unless @{$self->{expect}} == 0;
-    return $self->data;
+    return wantarray ? @{$self->{data}} : $self->{data}->[0];
 }
 
 sub error { @_ == 1 ? $_[0]->{error} : do { $_[0]->{error} = $_[1]; $_[0] } }
@@ -68,8 +71,7 @@ sub receive {
         else {
             my $msg = $Stream->recv_msg_nb;
             return 0 unless defined $msg;
-            return _fail("missing data type")
-                if $msg eq '';
+            next if $msg eq ''; # skip "blank lines"
             my $type = substr($msg, 0, 1, '');
             if ($type eq '+' or $type eq ':') { $datum = $msg }
             elsif ($type eq '-') { $datum = \$msg }
@@ -154,7 +156,8 @@ to have a $count greater than one if you are expecting multiple small
 responses due to pipelining or similar.  There is a throughput/latency
 tradeoff between receiving multiple responses and creating separate
 objects for each response, but batching small responses is usually the
-best approach for speed.
+best approach for speed.  A $count of zero is permitted: it generates
+an object containing no data and not expecting any.
 
 =head2 expect
 
