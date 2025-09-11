@@ -95,10 +95,7 @@ sub data_available {
 sub _fail_pending {
     my ($self) = @_;
     while (my $p = shift @{$self->[PENDING]}) {
-        my $parser = Socket::Stream::RESP2Parser
-            ->new($self->[STREAM], $p->[1])
-            ->error('aborted');
-        $p->[0]->($parser);
+        $p->[0]->(Socket::Stream::RESP2Parser->new_failed);
     }
     undef $self->[PENDING];
     return;
