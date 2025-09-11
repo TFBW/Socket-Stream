@@ -3,7 +3,7 @@ use strict;
 use warnings;
 
 package Socket::Stream;
-our $VERSION = '0.900';
+our $VERSION = '0.990';
 
 use if $ENV{DEBUG} => 'Debug::Comments';
 
@@ -193,95 +193,97 @@ sub send_data {
 # always try to find your message in the buffer first; if that fails,
 # use recv_status() or await_data() to obtain more and retry.  Copy
 # from the buffer freely, but modify it only when adding data.  This
-# is MUCH more efficient than splicing out the data you want.
+# is MUCH more efficient than splicing out the data you want.  The
+# recv methods are performance-critical: micro-optimisations can make
+# significant difference to something like the RESP2Parser.
 
-sub _take_msg {
-    my ($self, $n) = @_;
-    my $start = $self->[START];
-    $self->[START] += $n + length($self->[DELIM]);
-    return substr($self->[RECV], $start, $n);
-}
+# << local *Self = $_[0] >> is efficient and tidy where lots of access
+# to object parameters is required: "$Self[X]" replaces "$self->[X]".
+our @Self;
 
 sub recv_msg {
-    my ($self) = @_;
-    my $n;
+    local *Self = my $self = $_[0];
+    my ($n, $start);
     $self->start_timer;
-    while (($n = index($self->[RECV], $self->[DELIM], $self->[START])) < 0) {
-        $self->await_data
-            or return undef;
+    while (($n = index($Self[RECV], $Self[DELIM], $Self[START])) < 0) {
+        $self->await_data or return undef;
     }
-    return $self->_take_msg($n - $self->[START]);
+    $start = $Self[START];
+    $Self[START] = $n + length $Self[DELIM];
+    return substr($Self[RECV], $start, $n - $start);
 }
 
 sub recv_msg_nb {
-    my ($self) = @_;
-    my $n;
-    while (($n = index($self->[RECV], $self->[DELIM], $self->[START])) < 0) {
-        last unless $self->recv_status > 0;
-    }
-    return $self->_take_msg($n - $self->[START])
-        unless $n < 0;
-    $self->set_recv_err($! = EMSGSIZE)
-        if $self->buffer_full;
-    return;
-}
-
-sub _take {
-    my ($self, $n) = @_;
-    my $start = $self->[START];
-    $self->[START] += $n;
-    return substr($self->[RECV], $start, $n);
-}
-
-sub recv_re {
-    my ($self, $re) = @_;
-    $self->start_timer;
-    pos($self->[RECV]) = $self->[START];
-    until ($self->[RECV] =~ /$re/gc) {
-        $self->await_data
-            or return undef;
-    }
-    return $self->_take(pos($self->[RECV]) - $self->[START])
-}
-
-sub recv_re_nb {
-    my ($self, $re) = @_;
-    pos($self->[RECV]) = $self->[START];
-    until ($self->[RECV] =~ /$re/gc) {
+    local *Self = my $self = $_[0];
+    my ($n, $start);
+    while (($n = index($Self[RECV], $Self[DELIM], $Self[START])) < 0) {
         next if $self->recv_status > 0;
         $self->set_recv_err($! = EMSGSIZE)
             if $self->buffer_full;
         return;
     }
-    return $self->_take(pos($self->[RECV]) - $self->[START])
+    $start = $Self[START];
+    $Self[START] = $n + length $Self[DELIM];
+    return substr($Self[RECV], $start, $n - $start);
+}
+
+sub recv_re {
+    local *Self = my $self = $_[0];
+    $self->start_timer;
+    pos $Self[RECV] = $Self[START];
+    until ($Self[RECV] =~ /$_[1]/gc) {
+        $self->await_data or return undef;
+    }
+    my $start = $Self[START];
+    $Self[START] = pos $Self[RECV];
+    return substr($Self[RECV], $start, pos($Self[RECV]) - $start);
+}
+
+sub recv_re_nb {
+    local *Self = my $self = $_[0];
+    pos $Self[RECV] = $Self[START];
+    until ($Self[RECV] =~ /$_[1]/gc) {
+        next if $self->recv_status > 0;
+        $self->set_recv_err($! = EMSGSIZE)
+            if $self->buffer_full;
+        return;
+    }
+    my $start = $Self[START];
+    $Self[START] = pos $Self[RECV];
+    return substr($Self[RECV], $start, pos($Self[RECV]) - $start);
 }
 
 sub recv_data {
-    my ($self, $n) = @_;
-    local $self->[MAX_READ] = $n
-        if $n > $self->[MAX_READ];
+    local *Self = my $self = $_[0];
+    my $n = $_[1];
+    local $Self[MAX_READ] = $n
+        if $n > $Self[MAX_READ];
     $self->start_timer;
-    while ($self->buffer_used < $n) {
-        $self->await_data
-            or return undef;
+    while (length $Self[RECV] < $Self[START] + $n) {
+        $self->await_data or return undef;
     }
-    return $self->_take($n);
+    my $start = $Self[START];
+    $Self[START] += $n;
+    return substr($Self[RECV], $start, $n);
 }
 
 sub recv_data_nb {
-    my ($self, $n) = @_;
-    local $self->[MAX_READ] = $n
-        if $n > $self->[MAX_READ];
-    while ($self->buffer_used < $n) {
-        last unless $self->recv_status > 0;
+    local *Self = my $self = $_[0];
+    my $n = $_[1];
+    local $Self[MAX_READ] = $n
+        if $n > $Self[MAX_READ];
+    while (length $Self[RECV] < $Self[START] + $n) {
+        return undef unless $self->recv_status > 0;
     }
-    return $self->buffer_used < $n ? undef : $self->_take($n);
+    my $start = $Self[START];
+    $Self[START] += $n;
+    return substr($Self[RECV], $start, $n);
 }
 
 sub recv_status {
-    my ($self) = @_;
-    return 0 if $self->[RERR] or $self->[EOF];
-    unless ($self->[SOCK]->opened) {
+    local *Self =  my $self = $_[0];
+    return 0 if $Self[RERR] or $Self[EOF];
+    unless ($Self[SOCK]->opened) {
         $self->set_recv_err($! = EBADF);
         return 0;
     }
@@ -291,15 +293,18 @@ sub recv_status {
     my $recv;
     do {
         $! = 0;
-        recv($self->[SOCK], $recv, $n, MSG_NOSIGNAL);
+        recv($Self[SOCK], $recv, $n, MSG_NOSIGNAL);
     } while $! && $!{EINTR};
     return -1 if $! && BLOCKED;
     if (    $!     ) { $self->set_recv_err($!); return 0 }
     if ($recv eq '') { $self->set_recv_eof;     return 0 }
     #@! Received @{[length $recv]} bytes
-    $self->[RECV] = substr($self->[RECV], $self->[START]).$recv;
-    $self->[START] = 0;
-    return length($recv);
+    if ($Self[START]) {
+        $Self[RECV] = substr($Self[RECV], $Self[START]) . $recv;
+        $Self[START] = 0;
+    }
+    else { $Self[RECV] .= $recv }
+    return length $recv;
 }
 
 sub await_data {
@@ -334,7 +339,7 @@ sub await_io {
             my $wvec = $mode ? $evec : undef;
             $! = 0;
             select $rvec, $wvec, $evec, $self->time_left;
-        } while $!{EINTR} and $self->[SOCK]->opened;
+        } while $! && $!{EINTR} and $self->[SOCK]->opened;
     }
     #@! await_io done
     return;
@@ -426,7 +431,7 @@ This module is able to use L<AnyEvent> if it is loaded.  It is not
 required, but if it is present then all the "blocking" operations are
 executed in such a way that the main event loop runs while waiting.
 This also means that the "blocking" operations can't be called from
-within the event loop, such as from IO watchers: you will elecit a
+within the event loop, such as from IO watchers: you will elicit a
 "recursive blocking wait attempted" exception if you try.
 
 Similarly, the module uses L<Carp> to complain about incorrect usage
@@ -730,7 +735,8 @@ can include raw OS-provided error conditions or synthetic errors for
 timeout and buffer full.  The code is called with $! as the argument.
 As with the EOF condition, there may be unprocessed data in the read
 buffer when this condition arises.  You can turn receive errors into
-exceptions by dying in this callback.
+exceptions by dying in this callback, but avoid this if you are using
+L<AnyEvent> watchers to receive data.
 
 =head3 on_send_err
 
@@ -741,8 +747,8 @@ do-or-die semantics by dying in this callback.
 
 =head2 Internal Methods
 
-These methods are primarily intended for internal use, but they are
-available if needed.
+These methods are primarily intended for internal use, but they may be
+required in some more advanced use cases.
 
 =head3 has_timeout
 
@@ -768,7 +774,7 @@ True if L</"time_left"> is defined and zero or less.
     $stream->await_io($mode);
 
 Blocks waiting for incoming data ($mode == 0) or outgoing write buffer
-space ($mode == 1) up to the limits of the current running timer (see
+space ($mode == 1) up to the limit of the current running timer (see
 above).  If L<AnyEvent> is loaded, the "blocking" is performed using a
 condition variable which allows the main event loop to run.  There is
 no effect other than the possible blocking: no value is returned to
@@ -858,7 +864,7 @@ As with EMSGSIZE, this is intended to be a fatal condition, not an
 opportunity to consider whether to wait longer.  If you want to ask
 the user whether to keep waiting, use indefinite timeouts and manage
 your own timers.  You can always create a signal handler which shuts
-down the socket and send the signal at any time.
+down the socket and then send that signal at any time.
 
 =head2 EBADF
 
@@ -938,12 +944,13 @@ caught by C<< $stream->recv_status == 0 >>.
         "Exiting.";
     exit;
 
-=head2 RESP2 Client
+=head2 RESP2 Examples
 
-The module L<Socket::Stream::RESP2Client>, bundled with this one, is a
-good working example of a simple but real protocol.  RESP2 is used by
-Redis and other work-alike systems.  The module is not a full Redis
-API abstraction, but it could be used to implement one.
+The L<Socket::Stream::RESP2Client> and L<Socket::Stream::RESP2Parser>
+modules, bundled with this one, are good working examples of a simple
+but real protocol.  RESP2 is used by Redis and other work-alikes.  The
+modules are not a full Redis API abstraction, but they could be used
+to implement one.
 
 =head1 THREAD SAFETY
 
@@ -959,11 +966,11 @@ L<AnyEvent> is the supported event loop provider.  I don't recommend
 using this module in other event loop contexts.
 
 L<Time::Left> is used by this module to manage timeouts.  If you have
-additional time limits, you may find it useful.
+additional time limits to manage, you may find it useful.
 
-L<Socket::Stream::RESP2Client> uses this module to implement a RESP2
-client library.  It is useful both as an example and for simple Redis
-use cases.
+L<Socket::Stream::RESP2Client> and L<Socket::Stream::RESP2Parser> use
+this module to implement RESP2 client functions.  They are useful both
+as an example and for simple Redis use cases.
 
 =head1 LICENSE AND COPYRIGHT
 
