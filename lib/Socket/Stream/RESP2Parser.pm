@@ -38,7 +38,8 @@ sub expect {
         if defined $self->{error};
     $expect //= 1;
     _die("Invalid response count '$expect'")
-        unless $expect =~ /^\d+$/;
+        unless $expect =~ /^(?:\d+|inf)$/i;
+    $expect += 0; # numify
     @$self{qw(size error expect data)} =
         $expect > 0 ?
         (0, '', [$expect], [ [] ]) :
@@ -70,6 +71,20 @@ sub error {
 }
 
 sub is_finished { $_[0]->{error} or @{$_[0]->{expect}} == 0 }
+
+sub count {
+    my ($self) = @_;
+    my $data = @{$self->{expect}} ? $self->{data}->[0] : $self->{data};
+    return 0 + @$data;
+}
+
+sub take {
+    my ($self, $n) = @_;
+    $n //= 1;
+    return () unless $n > 0;
+    my $data = @{$self->{expect}} ? $self->{data}->[0] : $self->{data};
+    return splice(@$data, 0, $n);
+}
 
 our ($Stream, $Size, $Error, @Expect, @Data);
 sub _fail { ($Error) = @_; return -1 }
@@ -165,6 +180,13 @@ and recv_data_nb() to obtain data from the server.  None of these are
 subject to timeouts, so you will need to impose any timeout discipline
 externally.
 
+This is not a replacement for Redis.pm or any of its work-alikes: it
+has a completely different API and is not a general-purpose Redis
+interface.  Having said that, if you are planning a heavily pipelined
+workload, sending a large number of commands and then examining the
+responses, this module offers the ability to do the response-receiving
+part with great speed and flexibility.
+
 =head2 Parsed Data Model
 
 RESP2 can encode arrays, nulls, strings, integers, and errors.  Arrays
@@ -192,13 +214,21 @@ This is a pure object-oriented class with methods as follows.
     $parser = Socket::Stream::RESP2Parser->new($stream, $count);
 
 Creates a new $parser object which expects to see $count (default 1)
-server responses on $stream, a L<Socket::Stream> object.  You may want
-to have a $count greater than one if you are expecting multiple small
-responses due to pipelining or similar.  There is a throughput/latency
-tradeoff between receiving multiple responses and creating separate
-objects for each response, but batching small responses is usually the
-best approach for speed.  A $count of zero is permitted: it generates
-an object containing no data and not expecting any.
+messages (data items) on $stream, a L<Socket::Stream> object.  You may
+want to have a $count greater than one if you are expecting multiple
+small responses from Redis due to pipelining or similar.  There is a
+throughput/latency tradeoff between receiving multiple responses and
+creating separate objects for each response, but batching small
+responses is usually the best approach for speed.
+
+A couple of special possibilities exist.  A $count of zero generates
+an object containing no data and not expecting any.  This might be
+used in cases where an object of this type is promised, but there is
+no data to convey.  A count of "inf" generates an object expecting an
+infinite stream of messages.  This is useful in cases where no fixed
+number of messages is expected, such as a subscription, and you prefer
+to harvest responses from the object rather than create a stream of
+objects which expect one message each.  See the L</"take"> method.
 
 =head2 new_failed
 
@@ -280,6 +310,27 @@ and prevent further IO.  The $string must have a true value.
 True once receive() has returned a non-zero value; false otherwise.
 If true, the object either has complete data or an error.
 
+=head2 count
+
+    $count = $parser->count;
+
+Returns the number of complete messages received by the object.
+
+=head2 take
+
+    @data = $parser->take($n);
+
+Removes and returns the first $n messages from the object's data
+buffer.  If $n is omitted, it defaults to one; if called in a scalar
+context, returns the last datum in the list.  This is particularly
+useful for objects with an "inf" count: when a call to receive()
+returns, use count() to see if any complete messages have arrived, and
+take() those data items as you see fit.  You can't take() more items
+than are actually present: you get all available data if you try.
+Taking data reduces the count(), but does not alter the object's idea
+of still-expected messages.  It's possible to take() even if the
+parser is in an error state, unlike data().
+
 =head1 EXAMPLES
 
 The following example is a barebones Redis query tool which sends a
@@ -298,7 +349,7 @@ test, as it generates a large, deeply-nested response.
     $stream->send_msg("@ARGV" || 'ping');
     until ($parser->receive) {
         next if $stream->await_data;
-        die $stream->recv_err || "EOF encountered";
+        die $stream->recv_end;
     }
     dd($parser->data_or_die);
 
@@ -313,6 +364,17 @@ is assumed in this documentation.
 
 L<Socket::Stream::RESP2Client> uses this class to implement a fuller
 RESP2 client library.
+
+Redis.pm is the baseline pure Perl Redis client library.  This module
+is not intended to replace it: only a rather small subset of its total
+functionality is offered.  Informal testing shows that this module is
+somewhat faster in terms of parser throughput -- particularly if many
+small responses are pipelined, in which case the performance can even
+exceed that of L<Redis::Fast>, which is much faster at parsing large
+responses than this module.
+
+L<AnyEvent> is an event-loop abstraction library.  This module does
+not require it, but has been designed for compatibility with it.
 
 =head1 LICENSE AND COPYRIGHT
 
