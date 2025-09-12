@@ -13,119 +13,79 @@ use constant {
     ARRAY => ord '*',
 };
 
+our $MaxData = 10_000; # default limit on received data
+
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 sub new {
-    my ($class, $stream, $expect) = @_;
-    my $self = bless({ stream => $stream->use_CRLF }, ref($class)||$class);
-    return $self->expect($expect);
-}
-
-sub new_failed {
-    my ($class, $error) = @_;
-    $error ||= 'aborted';
-    return bless({ error => $error }, ref($class)||$class);
-}
-
-# Note that the 'expect' and 'data' fields are initialised as though
-# the object were told that an array of size $expect follows.  There
-# is a final "unwrap" at the end of receive() which promotes the
-# accumulated contents to the top level to save the extra drill-down
-# when accessing the final result (unless $expect is zero).
-sub expect {
-    my ($self, $expect) = @_;
-    _die("Can't expect() due to previous error")
-        if defined $self->{error};
-    $expect //= 1;
-    _die("Invalid response count '$expect'")
-        unless $expect =~ /^(?:\d+|inf)$/i;
-    $expect += 0; # numify
-    @$self{qw(size error expect data)} =
-        $expect > 0 ?
-        (0, '', [$expect], [ [] ]) :
-        (0, '', [], []);
-    return $self;
-}
-
-sub data {
-    my ($self) = @_;
-    return () if $self->{error} or @{$self->{expect}} > 0;
-    return wantarray ? @{$self->{data}} : $self->{data}->[0];
-}
-
-sub data_or_die {
-    my ($self) = @_;
-    _die("Parser error ($self->{error})")
-        if $self->{error};
-    _die("Response incomplete")
-        unless @{$self->{expect}} == 0;
-    return wantarray ? @{$self->{data}} : $self->{data}->[0];
+    my ($class, $stream) = @_;
+    my %self = (
+        stream => $stream->use_CRLF,
+        data   => [], # completed data
+        part   => [], # arrays in progress (count, array, ...)
+        size   => 0,  # nonzero when bulk string expected
+        error  => '', # becomes true on failure
+        );
+    return bless(\%self, ref($class)||$class);
 }
 
 sub error {
     my ($self, $error) = @_;
     return $self->{error} unless $error;
     $self->{error} = $error;
-    delete $self->{stream};
+    undef $self->{stream};
     return $self;
 }
 
-sub is_finished { $_[0]->{error} or @{$_[0]->{expect}} == 0 }
-
-sub count {
-    my ($self) = @_;
-    my $data = @{$self->{expect}} ? $self->{data}->[0] : $self->{data};
-    return 0 + @$data;
-}
+sub count { 0 + @{$_[0]->{data}} }
 
 sub take {
     my ($self, $n) = @_;
     $n //= 1;
-    return () unless $n > 0;
-    my $data = @{$self->{expect}} ? $self->{data}->[0] : $self->{data};
-    return splice(@$data, 0, $n);
+    return $n > 0 ? splice(@{$self->{data}}, 0, $n) : ();
 }
 
-our ($Stream, $Size, $Error, @Expect, @Data);
-sub _fail { ($Error) = @_; return -1 }
+our ($Stream, $Size, $Error, @Part, @Data);
+sub _fail { ($Error) = @_; undef $Stream; return -1 }
+sub _errcheck { my $err = $Stream->recv_end; return $err ? _fail($err) : 0 }
 sub receive {
-    my ($self) = @_;
+    my ($self, $n) = @_;
+    $n ||= $MaxData;
     # Aliasing trick: access object contents as package globals.
     # Improves readability and performance.
     local (*Stream, *Size, *Error) = \(@$self{qw(stream size error)});
     return -1 if $Error;
-    local *Expect = $self->{expect}; # @Expect
-    return 1 unless @Expect;
+    local *Part = $self->{part}; # @Part
     local *Data = $self->{data}; # @Data
     my ($datum, $msg, $type, $val);
-    # Performance-critical loop: micro-optimisations pay off here.
-    while (@Expect) {
+  DATUM: # Performance-critical loop: micro-optimisations pay off here.
+    while (@Data < $n) {
         if ($Size) {
             $datum = $Stream->recv_data_nb($Size)
-                // return 0;
+                // return _errcheck;
             return _fail("no CRLF after bulk string")
                 unless substr($datum, -2, 2, '') eq "\x0D\x0A";
             $Size = 0;
         }
         else {
             $msg = $Stream->recv_msg_nb
-                // return 0;
-            next if length $msg == 0; # skip "blank lines"
+                // return _errcheck;
+            next if length $msg == 0; # ignore "blank lines" from clients
             $type = ord $msg;
             $val = substr $msg, 1;
             if ($type == STR or $type == INT) { $datum = $val }
             elsif ($type == BULK) {
                 if ($val !~ /\D/) { $Size = $val + 2; next }
                 elsif ($val eq '-1') { undef $datum }
-                else { return _fail("invalid count '$val'") }
+                else { return _fail("invalid bulk count '$val'") }
             }
             elsif ($type == ARRAY) {
                 if ($val !~ /\D/) {
                     if ($val == 0) { $datum = [] }
-                    else { push @Data, []; push @Expect, $val; next }
+                    else { push @Part, $val, []; next }
                 }
                 elsif ($val eq '-1') { undef $datum }
-                else { return _fail("invalid count '$val'") }
+                else { return _fail("invalid array count '$val'") }
             }
             elsif ($type == ERR) { $datum = \(my $err = $val) }
             else {
@@ -134,15 +94,13 @@ sub receive {
                 $datum = [ $msg =~ /\S+/g ]; # "inline" command
             }
         }
-        while (@Expect) {
-            push @{$Data[-1]}, $datum;
-            last if --$Expect[-1] > 0;
-            # Array filled: pop the zero and merge the array as datum.
-            pop @Expect;
-            $datum = pop @Data;
+        while (@Part) {
+            push @{$Part[-1]}, $datum;
+            next DATUM if --$Part[-2] > 0; # expecting more
+            $datum = splice @Part, -2;
         }
+        push @Data, $datum;
     }
-    $self->{data} = $datum; # unwrap final result
     return 1;
 }
 
@@ -156,29 +114,27 @@ Socket::Stream::RESP2Parser - Progressive pure Perl RESP2 parser
 =head1 SYNOPSIS
 
     use Socket::Stream::RESP2Parser;
-    $parser = Socket::Stream::RESP2Parser->new($stream, $n);
-    until ($parser->receive) { $stream->await_data or last }
-    if ($parser->is_finished) {
-        $error = $parser->error;
-        $data = $parser->data;
-    }
-    $data = $parser->data_or_die;
+    $parser = Socket::Stream::RESP2Parser->new($stream);
+    until ($parser->receive($n)) { $stream->await_data }
+    $error = $parser->error;
+    @data = $parser->take($n);
 
 =head1 DESCRIPTION
 
-This is a pure Perl parser for RESP2 (Redis).  Client or server output
-is read from a L<Socket::Stream> object; only nonblocking IO methods
-are used.  If the entire message is not yet available in the stream,
-the object can parse what's present and continue where it left off
+This is a pure Perl parser for RESP2 (Redis).  The general principle
+of operation is simple: you give it a L<Socket::Stream> to manage and
+call receive() strategically.  It will convert the incoming stream to
+discrete data items which it stores in a queue for consumption via the
+take() method.
+
+Only two I/O methods are used on the underlying L<Socket::Stream>:
+recv_msg_nb() and recv_data_nb().  Both are nonblocking and safe to
+call from L<AnyEvent> I/O watchers if you wish to do so.  Nonblocking
+operations are not subject to timeouts, so you will need to impose any
+timeout discipline externally.  Partial responses are buffered with
+appropriate state, allowing the parser to continue where it left off
 once further data arrives.  The parser has very low overhead and uses
 no recursion or closures; L<Socket::Stream> is the only dependency.
-
-Only three methods are used on the underlying L<Socket::Stream>: the
-new() method invokes use_CRLF() on it to ensure that the appropriate
-message delimters are in use; the receive() method calls recv_msg_nb()
-and recv_data_nb() to obtain data from the server.  None of these are
-subject to timeouts, so you will need to impose any timeout discipline
-externally.
 
 This is not a replacement for Redis.pm or any of its work-alikes: it
 has a completely different API and is not a general-purpose Redis
@@ -194,10 +150,11 @@ are returned as ARRAY refs; null is returned as undef; integers and
 strings (simple and bulk) are returned as scalars.  Error strings are
 returned as scalar references to distinguish them from normal strings.
 
-The parser will also recognise inline commands: any datum which starts
-with an alphabetic character instead of one of the RESP2 type markers
-is converted to an array of strings split on whitespace, which is how
-the command would otherwise be packaged.  Blank lines are ignored.
+The parser will also recognise client-specific constructs such as
+inline commands: any datum which starts with an alphabetic character
+instead of one of the RESP2 type markers is converted to an array of
+strings split on whitespace, which is how the command would otherwise
+be packaged.  Blank lines are ignored.
 
 No effort is made to preserve the encoding method of the scalars, and
 no syntax checking is performed on integers.  Performing such a check
@@ -211,83 +168,55 @@ This is a pure object-oriented class with methods as follows.
 
 =head2 new
 
-    $parser = Socket::Stream::RESP2Parser->new($stream, $count);
+    $parser = Socket::Stream::RESP2Parser->new($stream);
 
-Creates a new $parser object which expects to see $count (default 1)
-messages (data items) on $stream, a L<Socket::Stream> object.  You may
-want to have a $count greater than one if you are expecting multiple
-small responses from Redis due to pipelining or similar.  There is a
-throughput/latency tradeoff between receiving multiple responses and
-creating separate objects for each response, but batching small
-responses is usually the best approach for speed.
-
-A couple of special possibilities exist.  A $count of zero generates
-an object containing no data and not expecting any.  This might be
-used in cases where an object of this type is promised, but there is
-no data to convey.  A count of "inf" generates an object expecting an
-infinite stream of messages.  This is useful in cases where no fixed
-number of messages is expected, such as a subscription, and you prefer
-to harvest responses from the object rather than create a stream of
-objects which expect one message each.  See the L</"take"> method.
-
-=head2 new_failed
-
-    $parser = Socket::Stream::RESP2Parser->new_failed($error);
-
-Creates a new $parser object in an error state.  The $error message
-can be omitted: it defaults to "aborted".  This is useful in lieu of
-an exception when one has promised to return an object of this class.
-
-=head2 expect
-
-    $parser = $parser->expect($count);
-
-Resets an existing object to expect $count new responses (default 1).
-This is effectively the same as creating a new object with the same
-stream, but saves a little overhead.  Note that this does nothing to
-the underlying stream, and the operation only makes sense if the
-stream is still up, working, and between responses.  The method will
-raise an exception if the $parser is in an error state.
+Creates a new $parser object which operates on the receive side of the
+given $stream, a L<Socket::Stream> object.
 
 =head2 receive
 
-    $status = $parser->receive;
+    $status = $parser->receive($n);
 
-Parses available data on the stream.  The returned $status is one of
-three values: 1 for complete and successful; 0 for incomplete; -1 for
-parser errors.  Once the method has returned a nonzero response, any
-further calls to the method do nothing and return the same value until
-expect() is called.
+Parses available data on the stream.  This only uses nonblocking read
+operations, so any delay will be minimal and CPU-intensive, returning
+when either $n data items are available in the queue ($status == 1),
+there is no more buffered data to process ($status == 0), or an error
+occurs which prevents further parsing ($status == -1).
 
-If the method returns zero, you should wait for the stream to be ready
-to read before calling again.  Monitoring the stream for errors is the
-caller's responsibility: this method does not distinguish between data
-not yet available and error/EOF conditions.  In the case of a parser
-error, the stream should be abandoned: there's no way to recover the
-session from such a state.
+If $n is undef or zero, a limit is applied via the package variable
+$MaxData, defaulting to 10,000.  You are welcome to tune this value to
+suit your application: it exists only to put an upper limit on how
+much unprocessed data can be queued.  If you are expecting very large
+responses, you may want to make it smaller.
 
-This method is safe to call from an L<AnyEvent> IO watcher: it does
-not block or raise exceptions.
+Only specify $n if you want to interrupt the parser as soon as that
+number of messages is available.  For highest throughput, omit $n and
+check L</"count"> on return to see if sufficient data has arrived.
 
-=head2 data
+The three return codes have implications for when you should next call
+receive().  If $status == 1 you may call again immediately; if $status
+== 0 you should wait for read-readiness on the stream before calling
+again; if $status == -1 the stream has failed and all further attempts
+will return -1 immediately: you should discard the stream and start
+over.  The error() method will provide further detail in this case.
 
-    $data = $parser->data;
-    @data = $parser->data;
+=head2 take
 
-If receive() has completed successfully ($status == 1), this method
-returns the first response in a scalar context, or all responses in a
-list context.  If receive() is incomplete or failed, an empty list is
-returned.  Note that the scalar version can't distinguish between a
-successful NULL response and the failure cases.
+    @data = $parser->take($n);
 
-=head2 data_or_die
+Removes and returns the first $n messages from the queue.  If $n is
+omitted, it defaults to one; if called in a scalar context, returns
+the last datum in the list.  Attempting to take more data than is
+available simply returns what's available.  It's acceptable to use
+this as a means to take data opportunistically, but bear in mind that
+a scalar context taking one item can't distinguish between NULL and
+the absence of an available message.
 
-    $data = $parser->data_or_die;
-    @data = $parser->data_or_die;
+=head2 count
 
-As per the data() method, except that the non-success cases raise an
-exception.  Exceptions are raised via L<Carp> croak() if loaded,
-vanilla die() if not.
+    $count = $parser->count;
+
+Returns the number of messages currently available to take().
 
 =head2 error
 
@@ -295,41 +224,13 @@ vanilla die() if not.
 
 With no argument, returns the parser error string if such an error has
 occurred, or the empty string otherwise.  Valid for use in a boolean
-context to detect parser failures.
+context to detect failures.
 
     $parser = $parser->error($string);
 
-With one argument, sets an error $string, e.g. to report an IO error.
+With one argument, sets an error $string, e.g. to report a timeout.
 This also flushes the L<Socket::Stream> object: all errors are fatal
-and prevent further IO.  The $string must have a true value.
-
-=head2 is_finished
-
-    $bool = $parser->is_finished;
-
-True once receive() has returned a non-zero value; false otherwise.
-If true, the object either has complete data or an error.
-
-=head2 count
-
-    $count = $parser->count;
-
-Returns the number of complete messages received by the object.
-
-=head2 take
-
-    @data = $parser->take($n);
-
-Removes and returns the first $n messages from the object's data
-buffer.  If $n is omitted, it defaults to one; if called in a scalar
-context, returns the last datum in the list.  This is particularly
-useful for objects with an "inf" count: when a call to receive()
-returns, use count() to see if any complete messages have arrived, and
-take() those data items as you see fit.  You can't take() more items
-than are actually present: you get all available data if you try.
-Taking data reduces the count(), but does not alter the object's idea
-of still-expected messages.  It's possible to take() even if the
-parser is in an error state, unlike data().
+and prevent further I/O.  The $string must have a true value.
 
 =head1 EXAMPLES
 
@@ -347,11 +248,9 @@ test, as it generates a large, deeply-nested response.
     my $stream = Socket::Stream->new($socket);
     my $parser = Socket::Stream::RESP2Parser->new($stream);
     $stream->send_msg("@ARGV" || 'ping');
-    until ($parser->receive) {
-        next if $stream->await_data;
-        die $stream->recv_end;
-    }
-    dd($parser->data_or_die);
+    until ($parser->receive(1)) { $stream->await_data }
+    die $parser->error if $parser->error;
+    dd $parser->take;
 
 For more realistic examples, see L<Socket::Stream::RESP2Client>.  That
 module provides both synchronous and asynchronous wrappers for this
