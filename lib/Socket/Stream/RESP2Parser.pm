@@ -196,12 +196,11 @@ number of messages is available.  For highest throughput, omit $n and
 check L</"count"> on return to see if sufficient data has arrived.
 
 The three return codes have implications for when you should next call
-receive().  If $status == 1 you may call again immediately, but you
-should probably take() the data first; if $status == 0 you should wait
-for read-readiness on the stream before calling again; if $status ==
--1 the stream has terminated and all further attempts will return -1
-immediately: you should discard the stream.  The error() method
-provides further detail in this case.
+receive(): $status == 1 means no waiting is required, but you should
+probably take some data first; $status == 0 means you should wait for
+read-readiness on the stream before calling again; $status == -1 means
+the stream has terminated, and any further attempts would also return
+-1.  The error() method provides further detail in this case.
 
 =head2 take
 
