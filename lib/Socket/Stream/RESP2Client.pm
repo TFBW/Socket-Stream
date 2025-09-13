@@ -3,22 +3,28 @@ use strict;
 use warnings;
 
 package Socket::Stream::RESP2Client;
-our $VERSION = '0.001';
+our $VERSION = '0.900';
 
 use Socket::Stream;
 use Socket::Stream::RESP2Parser;
 use Time::Left qw(time_left);
 
-use constant {
-    SOCKET  => 0,
-    STREAM  => 1,
-    TIMEOUT => 2,
-    TIMER   => 3,
-    PENDING => 4,
-    _EXTEND => 5, # for inheritance
+# Enumerated fields for array-based object
+use constant do {
+    my $i = 0;
+    my %enum = map { ($_ => $i++) } qw(
+        SOCKET
+        STREAM
+        PARSER
+        TIMEOUT
+        TIMER
+        PENDING
+        _EXTEND
+        );
+    \%enum
 };
 
-sub _NOOP { }
+sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
 
 # Arg is socket or host:port; default local Redis
 sub new {
@@ -30,10 +36,9 @@ sub new {
         $port ||= 6379; # use default Redis port if empty or zero
         $socket = Socket::Stream::INET("$host:$port");
     }
-    my $stream = Socket::Stream->new($socket)
-        ->on_send_err(sub { die "Send error: $!\n" })
-        ->use_CRLF;
-    return bless([$socket, $stream], ref($class)||$class);
+    my $stream = Socket::Stream->new($socket);
+    my $parser = Socket::Stream::RESP2Parser->new($stream);
+    return bless([$socket, $stream, $parser], ref($class)||$class);
 }
 
 sub socket { $_[0][SOCKET] }
@@ -45,7 +50,7 @@ sub request_raw {
     my $self = shift;
     $self->[STREAM]->timeout($self->[TIMEOUT]);
     $self->[STREAM]->send_msg(@_)
-        or die "Can't send request: $!\n";
+        or _die("Can't send request: $!");
     return $self;
 }
 
@@ -61,27 +66,24 @@ sub request {
 sub response {
     my ($self, $count) = @_;
     $count //= 1;
-    if (defined $self->[PENDING]) {
-        # Convert to an async request and wait
-        my $cv = AE::cv();
-        $self->response_cb($cv, $count);
-        return $cv->recv;
-    }
+    # Convert to an async request if any in progress
+    return $self->response_cv($count)->recv
+        if defined $self->[PENDING];
+    return () unless $count > 0;
+    my ($stream, $parser, $timer) = @$self[STREAM, PARSER, TIMER];
     $self->_start_timer;
-    my $stream = $self->[STREAM];
-    my $parser = Socket::Stream::RESP2Parser->new($stream, $count);
-    until ($parser->receive) {
-        $stream->timeout($self->[TIMER]->remaining);
+    until ($parser->receive($count) == 1) {
+        if (my $end = $stream->recv_end) { _die("Can't get response: $end") }
+        $stream->timeout($timer->remaining);
         $stream->start_timer;
-        next if $stream->await_data;
-        $parser->error($stream->recv_end);
+        $stream->await_data;
     }
-    return $parser;
+    return $parser->take($count);
 }
 
 sub call {
     my $self = shift;
-    return $self->request(@_)->response->data_or_die;
+    return $self->request(@_)->response;
 }
 
 sub data_available {
@@ -92,38 +94,39 @@ sub data_available {
 
 ### Receive data the hard way: non-blocking.
 
-sub _fail_pending {
-    my ($self) = @_;
-    while (my $p = shift @{$self->[PENDING]}) {
-        $p->[0]->(Socket::Stream::RESP2Parser->new_failed);
-    }
-    undef $self->[PENDING];
-    return;
-}
-
 sub _next_pending {
     my ($self) = @_;
-    while (@{$self->[PENDING]}) {
-        my ($cb, $count) = @{shift @{$self->[PENDING]}};
+    my ($Parser, $Pending) = @$self[PARSER, PENDING]; # object attributes
+    while (@$Pending) {
+        my ($cv, $count) = @{shift @$Pending};
         $self->_start_timer;
-        my $parser = Socket::Stream::RESP2Parser->new($self->[STREAM], $count);
-        my ($timer, $watcher, $done);
-        my $finish = sub { undef $timer; undef $watcher; $cb->($parser) };
-        my $fail = sub { $parser->error(@_); &$finish };
-        my $receive = sub { $done = $parser->receive; &$finish if $done };
+        my (@result, $aet, $aeio, $done, $recurse);
+        my $finish = sub { undef $aet; undef $aeio; $done = 1 };
+        my $receive = sub {
+            my $status;
+            do {
+                $status = $Parser->receive;
+                push @result, $Parser->take($count - @result);
+            } while $status == 1 and $count > @result;
+            if ($count == @result) {
+                $cv->send(@result);
+                &$finish;
+                $self->_next_pending if $recurse;
+            }
+            elsif (my $err = $Parser->error) {
+                $cv->croak($err);
+                while (my $p = shift @$Pending) { $p->[0]->croak($err) }
+                &$finish;
+            }
+            return;
+        };
         $receive->();
-        next if $done > 0;
-        return $self->_fail_pending if $done < 0;
+        next if $done;
         # Still here? We need to wait for data using AnyEvent.
-        $watcher = AE::io($self->[SOCKET], 0, sub {
-            $receive->();
-            return if not $done and not $self->[STREAM]->recv_end; # continue
-            return $self->_next_pending if $done > 0;              # success
-            $fail->($self->_recv_err) unless $done;
-            return $self->_fail_pending;
-                          });
-        $timer = AE::timer($self->[TIMER]->remaining, 0,
-                           sub { $fail->('timeout'); $self->_fail_pending })
+        $recurse = 1;
+        $aeio = AE::io($self->[SOCKET], 0, $receive);
+        $aet = AE::timer($self->[TIMER]->remaining, 0,
+                         sub { $Parser->error('timeout'); $receive->() })
             if $self->[TIMER]->is_limited;
         return;
     }
@@ -131,18 +134,25 @@ sub _next_pending {
     return;
 }
 
-sub response_cb {
-    my ($self, $cb, $count) = @_;
-    $cb //= \&_NOOP;
+sub response_cv {
+    my ($self, $count) = @_;
     $count //= 1;
+    _die("Invalid count '$count'")
+        if $count =~ /\D/;
+    my $cv = AE::cv();
     if ($self->[PENDING]) {
-        push @{$self->[PENDING]}, [$cb, $count];
+        push @{$self->[PENDING]}, [$cv, $count];
     }
     else {
-        $self->[PENDING] = [[$cb, $count]];
+        $self->[PENDING] = [[$cv, $count]];
         $self->_next_pending;
     }
-    return $self;
+    return $cv;
+}
+
+sub call_cv {
+    my $self = shift;
+    return $self->request(@_)->response_cv;
 }
 
 1;
@@ -160,14 +170,14 @@ TODO
 
 This is a simple low-level RESP2 (Redis) client interface based around
 L<Socket::Stream> and L<Socket::Stream::RESP2Parser>.  It is low-level
-in that is has no knowledge of any Redis commands, only the RESP2
-protocol which communicates commands and responses.
+in that is has no knowledge of any Redis commands, only the protocol
+(RESP2) which communicates commands and responses.
 
 Requests are always sent synchronously; responses may be received
 synchronously or, with L<AnyEvent>, asynchronously.  One distinctive
-feature of this module is the ability to pipeline commands: you can
-set up asynchronous response handlers in advance, then send the
-associated requests.
+feature of this module is the ability to pipeline commands to a much
+greater extent than usual: you can even set up asynchronous response
+handlers in advance, then send the associated requests.
 
 =head1 METHODS
 
@@ -193,7 +203,7 @@ exception is raised if socket connection fails.
 Sends a request to the server in the usual "array of bulk strings"
 style or dies trying.  The contents of @args should be byte-strings:
 any strings which may contain wide chars should be converted before
-sending.  Blocking IO is used, but the event loop will run while
+sending.  Blocking I/O is used, but the event loop will run while
 waiting if L<AnyEvent> is in use.
 
 =head2 request_raw
@@ -206,42 +216,38 @@ you can use it to send commands in the "inline" style if you want to.
 
 =head2 response
 
-    $parser = $client->response($count);
+    @data = $client->response($count);
 
-Blocks and waits for $count responses (default 1), returning the
-L<Socket::Stream::RESP2Parser> object which received the responses.
-Refer to that class for details on the parsing process, how to tell if
-the process was successful, and how to access the data if it was.  Any
-IO error encountered becomes an error condition on the $parser object.
+Blocks and waits for $count responses (default 1), returning the data
+as parsed by L<Socket::Stream::RESP2Parser>, or raising an exception
+if that is not possible.  Refer to that class for details on the data
+representation.  In a scalar context, returns the last item of @data.
 
 =head2 call
 
-    $data = $client->call(@args);
+    @data = $client->call(@args);
 
 Sends @args as a request, waits for the response, and returns the
-$data or raises an exception if an error prevents this.
+$data or raises an exception if an error prevents this.  In a scalar
+context, returns the last item of @data.
 
-=head2 response_cb
+=head2 response_cv
 
-    $client = $client->response_cb($code, $count);
+    $cv = $client->response_cv($count);
 
 Asynchronous response handling: only available if you have loaded the
 L<AnyEvent> module.  Differs from response() in that it does not block
-and delivers the L<Socket::Stream::RESP2Parser> object as an argument
-to the $code callback (i.e. C<< $code->($parser) >>) when parsing is
-complete.  The callback will happen immediately (inside the method) if
-possible, otherwise it will be called from an IO watcher when ready.
-The IO watcher context puts restrictions on what the callback may do:
-in particular it should not block or die.
+and delivers the data via $cv, an L<AnyEvent> condition variable.
 
-It is possible to queue response_cb() handlers: calling response_cb()
+It is possible to queue response_cv() handlers: calling response_cv()
 again before the previous one is complete results in the callbacks
 being placed in a queue.  If any response results in a failure, all
-remaining items in the queue are called back immediately with a parser
-object in an "aborted" error state, as recovery is not possible.
+remaining items in the queue fail in the same way.
 
-The response() method can be called while response_cb() operations are
-in progress: it will block until all pending responses are received.
+The response() method can be called while response_cv() operations are
+in progress: it will block until all pending responses are received;
+you may use C<< $client->response(0) >> to wait for all asynchronous
+requests to complete without fetching any more data.
 
 =head2 timeout
 
