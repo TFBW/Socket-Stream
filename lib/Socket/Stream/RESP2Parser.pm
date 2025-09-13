@@ -181,24 +181,27 @@ Parses available data on the stream.  This only uses nonblocking read
 operations, so any delay will be minimal and CPU-intensive, returning
 when either $n data items are available in the queue ($status == 1),
 there is no more buffered data to process ($status == 0), or an error
-occurs which prevents further parsing ($status == -1).
+occurs which prevents further parsing ($status == -1).  Note that in
+the latter two cases some messages may have been received and added to
+the queue: the return code only indicates the reason for stopping.
 
-If $n is undef or zero, a limit is applied via the package variable
-$MaxData, defaulting to 10,000.  You are welcome to tune this value to
-suit your application: it exists only to put an upper limit on how
-much unprocessed data can be queued.  If you are expecting very large
-responses, you may want to make it smaller.
+If $n is undef or zero, it defaults to the package variable $MaxData,
+initially 10,000.  You may tune this value to suit your application:
+it exists only to put an upper limit on how much unprocessed data can
+be queued.  If you are expecting very large responses, you may want to
+make it smaller.
 
 Only specify $n if you want to interrupt the parser as soon as that
 number of messages is available.  For highest throughput, omit $n and
 check L</"count"> on return to see if sufficient data has arrived.
 
 The three return codes have implications for when you should next call
-receive().  If $status == 1 you may call again immediately; if $status
-== 0 you should wait for read-readiness on the stream before calling
-again; if $status == -1 the stream has failed and all further attempts
-will return -1 immediately: you should discard the stream and start
-over.  The error() method will provide further detail in this case.
+receive().  If $status == 1 you may call again immediately, but you
+should probably take() the data first; if $status == 0 you should wait
+for read-readiness on the stream before calling again; if $status ==
+-1 the stream has terminated and all further attempts will return -1
+immediately: you should discard the stream.  The error() method
+provides further detail in this case.
 
 =head2 take
 
