@@ -70,11 +70,11 @@ sub response {
     return $self->response_cv($count)->recv
         if defined $self->[PENDING];
     return () unless $count > 0;
-    my ($stream, $parser, $timer) = @$self[STREAM, PARSER, TIMER];
+    my ($stream, $parser) = @$self[STREAM, PARSER];
     $self->_start_timer;
     until ($parser->receive($count) == 1) {
         if (my $end = $stream->recv_end) { _die("Can't get response: $end") }
-        $stream->timeout($timer->remaining);
+        $stream->timeout($self->[TIMER]->remaining);
         $stream->start_timer;
         $stream->await_data;
     }
@@ -86,10 +86,23 @@ sub call {
     return $self->request(@_)->response;
 }
 
-sub data_available {
-    my ($self) = @_;
-    $self->[STREAM]->recv_status; # obtain data if available
-    return $self->[STREAM]->buffer_used;
+sub available_responses {
+    my ($self, $count) = @_;
+    return wantarray ? () : 0
+        if defined $self->[PENDING];
+    my $status = $self->[PARSER]->receive($count);
+    return $self->[PARSER]->take($count || $self->[PARSER]->count)
+        if wantarray;
+    return $count && $status == 1 ? $count : $self->[PARSER]->count;
+}
+
+sub await_response {
+    my ($self, $count) = @_;
+    $count ||= 1;
+    $self->response(0); # await async responses, if any
+    $self->[STREAM]->await_data
+        until $self->available_responses($count) == $count;
+    return $self;
 }
 
 ### Receive data the hard way: non-blocking.
@@ -100,10 +113,9 @@ sub _next_pending {
     while (@$Pending) {
         my ($cv, $count) = @{shift @$Pending};
         $self->_start_timer;
-        my (@result, $aet, $aeio, $done, $recurse);
+        my (@result, $aet, $aeio, $done, $recurse, $status);
         my $finish = sub { undef $aet; undef $aeio; $done = 1 };
         my $receive = sub {
-            my $status;
             do {
                 $status = $Parser->receive;
                 push @result, $Parser->take($count - @result);
@@ -139,6 +151,8 @@ sub response_cv {
     $count //= 1;
     _die("Invalid count '$count'")
         if $count =~ /\D/;
+    _die("response_cv() requires AnyEvent")
+        unless exists &AE::cv;
     my $cv = AE::cv();
     if ($self->[PENDING]) {
         push @{$self->[PENDING]}, [$cv, $count];
@@ -171,20 +185,25 @@ TODO
 This is a simple low-level RESP2 (Redis) client interface based around
 L<Socket::Stream> and L<Socket::Stream::RESP2Parser>.  It is low-level
 in that is has no knowledge of any Redis commands, only the protocol
-(RESP2) which communicates commands and responses.
+(RESP2) which conveys them.  This is a fairly thin convenience layer
+over L<Socket::Stream> and L<Socket::Stream::RESP2Parser> except for
+the management of asynchronous responses via L</"response_cv">, which
+adds substantial logic.
 
 Requests are always sent synchronously; responses may be received
 synchronously or, with L<AnyEvent>, asynchronously.  One distinctive
 feature of this module is the ability to pipeline commands to a much
 greater extent than usual: you can even set up asynchronous response
-handlers in advance, then send the associated requests.
+handlers in advance, then send the associated requests.  This pattern
+is highly efficient and can outperform L<Redis::Fast> in some cases.
 
 =head1 METHODS
 
 The module is object-oriented and has the following methods.  Note
 that any exceptions or failures are generally unrecoverable: once you
 encounter one, you should dispose of the object and its socket rather
-than attempt further communication.
+than attempt further communication.  "Blocking" operations allow the
+event loop to run if the L<AnyEvent> module is loaded.
 
 =head2 new
 
@@ -217,19 +236,53 @@ you can use it to send commands in the "inline" style if you want to.
 =head2 response
 
     @data = $client->response($count);
+    $data = $client->response;
 
 Blocks and waits for $count responses (default 1), returning the data
 as parsed by L<Socket::Stream::RESP2Parser>, or raising an exception
 if that is not possible.  Refer to that class for details on the data
-representation.  In a scalar context, returns the last item of @data.
+representation.  In scalar context, returns the B<last> item of @data.
+
+A $count of zero always returns an empty list but has the useful side
+effect of blocking until all L</"response_cv"> operations complete,
+like wait_all_responses() in L<Redis>.
 
 =head2 call
 
-    @data = $client->call(@args);
+    $data = $client->call(@args);
 
-Sends @args as a request, waits for the response, and returns the
-$data or raises an exception if an error prevents this.  In a scalar
-context, returns the last item of @data.
+Sends @args via request(), waits for a single response, and returns
+the response $data or raises an exception if an error prevents this.
+
+=head2 available_responses
+
+    @data = $client->available_responses($count);
+    $n = $client->available_responses($count);
+
+This is a nonblocking operation which obtains responses only if they
+are immediately available.  In a list context, it receives the actual
+responses; in a scalar context it returns a count of responses which
+could be requested without blocking.  If $count is a true value, it
+sets an upper limit on the number of responses to receive or report;
+if it's false, the upper limit is imposed by the parser.  The main
+difference is that the open-ended version will parse as much data as
+is available, whereas the $count-limited version will return quickly
+if the count is satisfied.
+
+Note that this will immediately return zero/empty if called when any
+response_cv() operations are in progress.
+
+=head2 await_response
+
+    $client = $client->await_response($count);
+
+This is a simple blocking operation which returns when at least $count
+responses are available, defaulting to 1 if false.  If there are any
+response_cv() operations in progress, this will wait for them to
+complete first.  Returns self when ready.
+
+Use this in conjunction with available_responses() if no responses are
+available and you have nothing better to do than wait for one.
 
 =head2 response_cv
 
@@ -237,17 +290,16 @@ context, returns the last item of @data.
 
 Asynchronous response handling: only available if you have loaded the
 L<AnyEvent> module.  Differs from response() in that it does not block
-and delivers the data via $cv, an L<AnyEvent> condition variable.
+and delivers the data via $cv, an L<AnyEvent> condition variable.  If
+the requested number of responses can't be obtained due to parser or
+stream failure, the $cv will croak.
 
-It is possible to queue response_cv() handlers: calling response_cv()
-again before the previous one is complete results in the callbacks
-being placed in a queue.  If any response results in a failure, all
-remaining items in the queue fail in the same way.
-
-The response() method can be called while response_cv() operations are
-in progress: it will block until all pending responses are received;
-you may use C<< $client->response(0) >> to wait for all asynchronous
-requests to complete without fetching any more data.
+Calling response_cv() again before the previous one is complete is
+permitted: the requests are queued in the natural FIFO order.  The
+response() method can also be called while response_cv() operations
+are in progress: it will block until all pending responses are
+received; you may use C<< $client->response(0) >> to wait for all
+asynchronous requests to complete without fetching any more data.
 
 =head2 timeout
 
@@ -258,20 +310,16 @@ default is undef, meaning no limit.  The duration can be set to a
 number of seconds or a time-unit string as accepted by to_seconds() in
 L<Time::Left>; invalid values will result in an exception.  Operations
 which exceed the time limit are aborted with an error.  In the case of
-response_cb(), the time limit applies to each response individually,
-representing the maximum wait for a callback once the operation is at
-the head of the queue.  If you want to impose a time limit on a group
-of operations, create a separate L<Time::Left> object or similar and
-dynamically adjust this timeout.
+response_cv(), the timer starts when it reaches the head of the queue.
+Bear in mind that a timeout is a fatal error on the underlying stream,
+not a soft interrupt.
 
-=head2 data_available
-
-    $count = $client->data_available;
-
-Returns the number of bytes currently ready to read on the response
-side of the socket.  This can be used as a cheap alternative to full
-nonblocking operation: just do something else until data is available,
-then call response().
+If you want to impose a timeout on a group of response() operations,
+dynamically adjust this timeout between calls using a L<Time::Left>
+object or similar.  Asynchronous response_cv() calls can do the same
+thing only if they set a callback on the CV in advance and adjust the
+timeout during the callback.  It may be simpler to impose the limit
+with an L<AnyEvent> timer that shuts down the stream or similar.
 
 =head2 socket
 
@@ -289,3 +337,59 @@ perform further operations.  Long-running applications should always
 remain aware that servers need to restart occasionally, so loss of
 connectivity should be handled gracefully.
 
+=head1 EXAMPLES
+
+The following examples are variations on one in the L<Redis::Fast> POD
+which demonstrates pipelined performance.  The workload consists of a
+large number of small, fast operations.  These examples also serve as
+a short tutorial on pipeline performance.
+
+The examples will start with the most basic and build towards more
+efficient and sophisticated solutions.  Each example is a function
+which takes a total $count and $batch size to use when performing a
+single operation, specifically "set hoge fuga", repeatedly.  The
+function returns the number of errors encountered, which is a feature
+not present in the original L<Redis::Fast> example.
+
+The first example is a translation of the original L<Redis::Fast>
+example code into this subroutine format.
+
+    use Redis::Fast;
+    my $REDIS = Redis::Fast->new;
+    sub redis {
+        my ($count, $batch) = @_;
+        my $err = 0;
+        while ($count) {
+            $batch = $count if $batch > $count;
+            $count -= $batch;
+            $REDIS->set(hoge => 'fuga', sub { $err++ if defined $_[1] })
+                for 1..$batch;
+            $REDIS->wait_all_responses;
+        }
+        return $err;
+    }
+
+This is fairly straightforward: the total load is broken up into
+batches of the specified size, with the last batch taking the remains.
+The batch of commands is sent, and we await the responses.  Each batch
+is a simple pipeline where everything is added to the pipeline, then
+everything is extracted from it.  Larger batches require more memory.
+
+Here's the same concept in terms of this module.
+
+    use Socket::Stream::RESP2Client;
+    my $RESP = Socket::Stream::RESP2Client->new;
+    sub basic {
+        my ($count, $batch) = @_;
+        my $err = 0;
+        while ($count) {
+            $batch = $count if $batch > $count;
+            $count -= $batch;
+            $RESP->request_raw(($CMD) x $batch);
+            for ($RESP->response($batch)) { $err++ if ref eq 'SCALAR' }
+        }
+        return $err;
+    }
+
+The key difference is that we have separate methods for sending
+requests and receiving responses, each called once par batch.
