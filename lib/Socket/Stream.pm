@@ -960,6 +960,12 @@ should be confined to a single thread.  If you need to gather or fan
 out messages across threads, do that in a higher layer using
 L<Thread::Queue> or similar.
 
+Having said that, there is a special case where an underlying socket
+might be shared between threads or processes, each of which has its
+own B<Socket::Stream> object: if one object is dealing exclusively
+with send-based operations and the other is recv-only, the two will
+not conflict.
+
 =head1 SEE ALSO
 
 L<AnyEvent> is the supported event loop provider.  I don't recommend

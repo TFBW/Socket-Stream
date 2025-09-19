@@ -205,14 +205,15 @@ the stream has terminated, and any further attempts would also return
 =head2 take
 
     @data = $parser->take($n);
+    $data = $parser->take;
 
 Removes and returns the first $n messages from the queue.  If $n is
 omitted, it defaults to one; if called in a scalar context, returns
-the last datum in the list.  Attempting to take more data than is
-available simply returns what's available.  It's acceptable to use
-this as a means to take data opportunistically, but bear in mind that
-a scalar context taking one item can't distinguish between NULL and
-the absence of an available message.
+the last datum in the list.  This is a no-op for $n of zero or less;
+attempting to take more data than is available simply returns what's
+available.  It's acceptable to take data opportunistically (without
+checking for availability), but bear in mind that scalar context can't
+distinguish between NULL and the absence of an available message.
 
 =head2 count
 
@@ -253,6 +254,45 @@ test, as it generates a large, deeply-nested response.
     until ($parser->receive(1)) { $stream->await_data }
     die $parser->error if $parser->error;
     dd $parser->take;
+
+The next example is derived from a "performance in pipeline mode"
+example in the L<Redis::Fast> POD.  The key difference with this
+module is that the send and receive operations are entirely separate,
+so you have better control over how the operations are batched.  A
+more sophisticated example would use L<AnyEvent> and set up response
+handlers in advance of sending the requests, but even this blocking
+approach obtains better performance than L<Redis::Fast> despite that
+module being much faster in terms of raw parsing performance.  Note
+that the code for this module checks all responses for errors.
+
+    use Redis;
+    use Redis::Fast;
+    use Socket::Stream;
+    use Socket::Stream::RESP2Parser;
+    use Time::HiRes qw(time);
+    my $count = 100000;
+    for ('Redis', 'Redis::Fast') {
+        my $r = $_->new;
+        my $start = time;
+        for(1..$count) {
+            $r->set('hoge', 'fuga', sub{});
+        }
+        $r->wait_all_responses;
+        printf "%s:\n%.2f/s\n", $_, $count / (time - $start);
+    }
+    {
+        my $socket = Socket::Stream::INET('127.0.0.1:6379');
+        my $stream = Socket::Stream->new($socket);
+        my $parser = Socket::Stream::RESP2Parser->new($stream);
+        my $start = time;
+        for (1..$count) {
+            $stream->send_msg("set hoge fuga");
+        }
+        until ($parser->receive($count)) { $stream->await_data }
+        if (my $err = $parser->error) { die "Failed: $err\n" }
+        for ($parser->take($count)) { die "$$_\n" if ref($_) eq 'SCALAR'  }
+        printf "RESP2Parser:\n%.2f/s\n", $count / (time - $start);
+    }
 
 For more realistic examples, see L<Socket::Stream::RESP2Client>.  That
 module provides both synchronous and asynchronous wrappers for this
