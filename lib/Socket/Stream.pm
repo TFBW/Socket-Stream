@@ -326,8 +326,9 @@ sub await_io {
     if (USING_AE) {
         #@! await_io @{[$mode?'write':'read']} using AE
         my $cv = AE::cv();
-        my $w  = AE::io($self->[SOCK], $mode ? 1 : 0, $cv);
-        my $t  = AE::timer($self->time_left, 0, $cv)
+        my $cb = sub { $cv->send };
+        my $w = AE::io($self->[SOCK], $mode ? 1 : 0, $cb);
+        my $t = AE::timer($self->time_left, 0, $cb)
             if $self->has_timeout;
         $cv->recv; # pause until unblocked or timed-out
     }
