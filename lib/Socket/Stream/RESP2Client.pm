@@ -3,7 +3,7 @@ use strict;
 use warnings;
 
 package Socket::Stream::RESP2Client;
-our $VERSION = '0.900';
+our $VERSION = '0.990';
 
 use Socket::Stream;
 use Socket::Stream::RESP2Parser;
@@ -45,7 +45,6 @@ sub socket { $_[0][SOCKET] }
 sub timeout { time_left($_[0][TIMEOUT] = $_[1]); $_[0] }
 sub _start_timer { $_[0][TIMER] = time_left($_[0][TIMEOUT]) }
 
-# Send one or more strings as messages; can be used for inline style.
 sub request_raw {
     my $self = shift;
     $self->[STREAM]->timeout($self->[TIMEOUT]);
@@ -54,7 +53,6 @@ sub request_raw {
     return $self;
 }
 
-# Send a request in the normal "array of bulk strings" style.
 sub request {
     my $self = shift;
     my $n = @_;
@@ -70,15 +68,15 @@ sub response {
     return $self->response_cv($count)->recv
         if defined $self->[PENDING];
     return () unless $count > 0;
-    my ($stream, $parser) = @$self[STREAM, PARSER];
+    my $stream = $self->[STREAM];
     $self->_start_timer;
-    until ($parser->receive($count) == 1) {
+    until ($self->[PARSER]->receive($count) == 1) {
         if (my $end = $stream->recv_end) { _die("Can't get response: $end") }
         $stream->timeout($self->[TIMER]->remaining);
         $stream->start_timer;
         $stream->await_data;
     }
-    return $parser->take($count);
+    return $self->[PARSER]->take($count);
 }
 
 sub call {
@@ -178,7 +176,20 @@ Socket::Stream::RESP2Client - RESP2 (Redis) client using Socket::Stream
 
 =head1 SYNOPSIS
 
-TODO
+    use Socket::Stream::RESP2Client;
+    $client = Socket::Stream::RESP2Client->new($socket);
+    $client = $client->request(@args);
+    $client = $client->request_raw(@strings);
+    @data = $client->response($count);
+    $data = $client->response;
+    $data = $client->call(@args);
+    @data = $client->available_responses($count);
+    $n = $client->available_responses($count);
+    $client = $client->await_response($count);
+    $cv = $client->response_cv($count);
+    $cv = $client->call_cv(@args);
+    $client = $client->timeout($duration);
+    $socket = $client->socket;
 
 =head1 DESCRIPTION
 
@@ -301,6 +312,13 @@ are in progress: it will block until all pending responses are
 received; you may use C<< $client->response(0) >> to wait for all
 asynchronous requests to complete without fetching any more data.
 
+=head2 call_cv
+
+    $cv = $client->call_cv(@args);
+
+Sends @args via request() and returns an L<AnyEvent> condition
+variable to deliver the response data.
+
 =head2 timeout
 
     $client = $client->timeout($duration);
@@ -318,15 +336,16 @@ If you want to impose a timeout on a group of response() operations,
 dynamically adjust this timeout between calls using a L<Time::Left>
 object or similar.  Asynchronous response_cv() calls can do the same
 thing only if they set a callback on the CV in advance and adjust the
-timeout during the callback.  It may be simpler to impose the limit
-with an L<AnyEvent> timer that shuts down the stream or similar.
+timeout during the callback: the callback is executed before the next
+timer starts.  It may be simpler to impose the limit with a separate
+L<AnyEvent> timer that shuts down the stream or similar.
 
 =head2 socket
 
     $socket = $client->socket;
 
 Provides access to the socket created at new().  If a connected socket
-was provided at new(), this returns the same socket.
+was provided at new(), this returns that socket.
 
 =head1 ERRORS
 
@@ -349,10 +368,12 @@ efficient and sophisticated solutions.  Each example is a function
 which takes a total $count and $batch size to use when performing a
 single operation, specifically "set hoge fuga", repeatedly.  The
 function returns the number of errors encountered, which is a feature
-not present in the original L<Redis::Fast> example.
+not present in the original L<Redis::Fast> example.  The original
+example did not have batching, either: all the work was processed in a
+single huge batch.
 
 The first example is a translation of the original L<Redis::Fast>
-example code into this subroutine format.
+example code into this batched-subroutine format.
 
     use Redis::Fast;
     my $REDIS = Redis::Fast->new;
@@ -373,7 +394,7 @@ This is fairly straightforward: the total load is broken up into
 batches of the specified size, with the last batch taking the remains.
 The batch of commands is sent, and we await the responses.  Each batch
 is a simple pipeline where everything is added to the pipeline, then
-everything is extracted from it.  Larger batches require more memory.
+everything is extracted from it.  Larger batches use more memory.
 
 Here's the same concept in terms of this module.
 
@@ -385,11 +406,132 @@ Here's the same concept in terms of this module.
         while ($count) {
             $batch = $count if $batch > $count;
             $count -= $batch;
-            $RESP->request_raw(($CMD) x $batch);
+            $RESP->request_raw(("set hoge fuga") x $batch);
             for ($RESP->response($batch)) { $err++ if ref eq 'SCALAR' }
         }
         return $err;
     }
 
 The key difference is that we have separate methods for sending
-requests and receiving responses, each called once par batch.
+requests and receiving responses, each called once par batch.  The
+larger the batch size, the more memory used, but even small batch
+sizes (e.g. 10) improve throughput significantly.  This module
+performs comparably to L<Redis::Fast> in this context, getting better
+with larger batch sizes.  The speed of L<Redis::Fast> is mostly a
+factor of its parser, and there's not a lot to parse here.
+
+Both these examples violate the first rule of pipelining, however:
+"keep your pipeline as small as possible without letting it run dry."
+Both examples run dry at the end of each batch.  This means there is
+idle time at the server whille it waits for the next batch.  The next
+example solves this by having a "staged" approach where the response
+processing of the first batch is postponed until after the second
+batch of requests has been sent.  Requests and responses are counted
+separately to acommodate this.
+
+    use Socket::Stream::RESP2Client;
+    my $RESP = Socket::Stream::RESP2Client->new;
+    sub staged {
+        my ($count, $batch) = @_;
+        my $stot = my $rtot = $count;
+        my $stage = 2;
+        my $n;
+        my $err = 0;
+        while ($rtot) {
+            if ($stot) {
+                $n = $batch > $stot ? $stot : $batch;
+                $stot -= $n;
+                $RESP->request_raw(("set hoge fuga") x $n);
+            }
+            next if --$stage > 0;
+            $n = $batch > $rtot ? $rtot : $batch;
+            $rtot -= $n;
+            for ($RESP->response($n)) { $err++ if ref eq 'SCALAR' }
+        }
+        return $err;
+    }
+
+This is quite an efficient pattern, and my development environment was
+able to drive Redis to near 100% CPU utilisation with a batch size as
+small as 100, making Redis itself the bottleneck.  L<Redis::Fast>
+can't reach that kind of throughput with this workload: its parser
+performance doesn't help given the simple "+OK" responses expected.
+
+A variation on this pattern is to read available responses, sending
+another batch of requests when the total number in the pipeline is one
+batch or less.  Performance-wise this isn't much different from the
+simple staged approach.  Response-counting is changed to handle the
+variation in response numbers, and the number of responses processed
+is limited to one batch so we don't neglect the send side too long.
+
+    use Socket::Stream::RESP2Client;
+    my $RESP = Socket::Stream::RESP2Client->new;
+    sub avail {
+        my ($count, $batch) = @_;
+        my $stot = my $rtot = $count;
+        my $n;
+        my $err = 0;
+        while ($rtot) {
+            if ($stot and $rtot - $stot <= $batch) {
+                $n = $batch > $stot ? $stot : $batch;
+                $stot -= $n;
+                $RESP->request_raw(("set hoge fuga") x $n);
+            }
+            else { $RESP->await_response }
+            for ($RESP->available_responses($batch)) {
+                $rtot--;
+                $err++ if ref eq 'SCALAR';
+            }
+        }
+        return $err;
+    }
+
+The last example is asynchronous and requires L<AnyEvent>.  This is
+like the staged approach, but L<AnyEvent> condition variables are used
+to limit the send rate.  Note that the response handler is set up
+before the requests are sent -- the textbook-correct way to prevent
+communications deadlock.
+
+    use Socket::Stream::RESP2Client;
+    my $RESP = Socket::Stream::RESP2Client->new;
+    sub event {
+        my ($count, $batch) = @_;
+        my @block;
+        my $err = 0;
+        while ($count) {
+            $batch = $count if $batch > $count;
+            $count -= $batch;
+            my $done = AE::cv();
+            push @block, $done;
+            $RESP->response_cv($batch)->cb(
+                sub {
+                    for ($_[0]->recv) { $err++ if ref eq 'SCALAR' }
+                    $done->send;
+                });
+            $RESP->request_raw(("set hoge fuga") x $batch);
+            shift(@block)->recv if @block > 1;
+        }
+        $_->recv for @block; # wait for completion
+        return $err;
+    }
+
+=head1 SEE ALSO
+
+L<Socket::Stream> performs the low-level I/O operations.
+
+L<Socket::Stream::RESP2Parser> performs the response-parsing.
+
+Numerous other Redis modules on CPAN, most of them patterned after
+Redis.pm (L<Redis>).
+
+L<AnyEvent> is the event-loop abstraction library required in order to
+use the L</"response_cv"> async response method.
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2025 by Brett Watson.
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=cut
