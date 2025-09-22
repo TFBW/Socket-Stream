@@ -7,7 +7,7 @@ our $VERSION = '0.990';
 
 use Socket::Stream;
 use Socket::Stream::RESP2Parser;
-use Time::Left qw(time_left);
+use Time::Left qw(to_seconds);
 
 # Enumerated fields for array-based object
 use constant do {
@@ -17,7 +17,6 @@ use constant do {
         STREAM
         PARSER
         TIMEOUT
-        TIMER
         PENDING
         _EXTEND
         );
@@ -25,6 +24,8 @@ use constant do {
 };
 
 sub _die { exists(&Carp::croak) ? goto &Carp::croak : die "@_\n" }
+sub _timeout { defined($_[0]) ? to_seconds($_[0]) // _die("Invalid timeout '$_[0]'") : undef }
+sub _timer { Time::Left->new(_timeout($_[0])) }
 
 # Arg is socket or host:port; default local Redis
 sub new {
@@ -42,8 +43,7 @@ sub new {
 }
 
 sub socket { $_[0][SOCKET] }
-sub timeout { time_left($_[0][TIMEOUT] = $_[1]); $_[0] }
-sub _start_timer { $_[0][TIMER] = time_left($_[0][TIMEOUT]) }
+sub timeout { @_ == 1 ? $_[0][TIMEOUT] : do { $_[0][TIMEOUT] = _timeout($_[1]); $_[0] } }
 
 sub request_raw {
     my $self = shift;
@@ -62,26 +62,20 @@ sub request {
 }
 
 sub response {
-    my ($self, $count) = @_;
+    my ($self, $count, $timeout) = @_;
     $count //= 1;
+    $timeout = $self->[TIMEOUT] if @_ < 3;
     # Convert to an async request if any in progress
-    return $self->response_cv($count)->recv
+    return $self->response_cv($count, $timeout)->recv
         if defined $self->[PENDING];
     return () unless $count > 0;
-    my $stream = $self->[STREAM];
-    $self->_start_timer;
-    until ($self->[PARSER]->receive($count) == 1) {
-        if (my $end = $stream->recv_end) { _die("Can't get response: $end") }
-        $stream->timeout($self->[TIMER]->remaining);
-        $stream->start_timer;
-        $stream->await_data;
-    }
-    return $self->[PARSER]->take($count);
+    return $self->await_response($count, $timeout)->[PARSER]->take($count);
 }
 
 sub call {
     my $self = shift;
-    return $self->request(@_)->response;
+    my $timer = _timer($self->timeout);
+    return $self->request(@_)->response(1, $timer->remaining);
 }
 
 sub available_responses {
@@ -95,11 +89,17 @@ sub available_responses {
 }
 
 sub await_response {
-    my ($self, $count) = @_;
+    my ($self, $count, $timeout) = @_;
     $count ||= 1;
-    $self->response(0); # await async responses, if any
-    $self->[STREAM]->await_data
-        until $self->available_responses($count) == $count;
+    $timeout = $self->[TIMEOUT] if @_ < 3;
+    $self->response_cv(0, $timeout)->recv
+        if defined $self->[PENDING];
+    my $timer = _timer($timeout);
+    until ($self->[PARSER]->receive($count) == 1) {
+        if (my $end = $self->[STREAM]->recv_end) { _die("Stream ended: $end") }
+        $self->[STREAM]->timeout($timer->remaining)->start_timer;
+        $self->[STREAM]->await_data;
+    }
     return $self;
 }
 
@@ -109,8 +109,8 @@ sub _next_pending {
     my ($self) = @_;
     my ($Parser, $Pending) = @$self[PARSER, PENDING]; # object attributes
     while (@$Pending) {
-        my ($cv, $count) = @{shift @$Pending};
-        $self->_start_timer;
+        my ($cv, $count, $timeout) = @{shift @$Pending};
+        my $timer = _timer($timeout);
         my (@result, $aet, $aeio, $done, $recurse, $status);
         my $finish = sub { undef $aet; undef $aeio; $done = 1 };
         my $receive = sub {
@@ -135,9 +135,9 @@ sub _next_pending {
         # Still here? We need to wait for data using AnyEvent.
         $recurse = 1;
         $aeio = AE::io($self->[SOCKET], 0, $receive);
-        $aet = AE::timer($self->[TIMER]->remaining, 0,
+        $aet = AE::timer($timer->remaining, 0,
                          sub { $Parser->error('timeout'); $receive->() })
-            if $self->[TIMER]->is_limited;
+            if $timer->is_limited;
         return;
     }
     undef $self->[PENDING];
@@ -145,18 +145,19 @@ sub _next_pending {
 }
 
 sub response_cv {
-    my ($self, $count) = @_;
+    my ($self, $count, $timeout) = @_;
     $count //= 1;
+    $timeout = $self->[TIMEOUT] if @_ < 3;
     _die("Invalid count '$count'")
         if $count =~ /\D/;
     _die("response_cv() requires AnyEvent")
         unless exists &AE::cv;
     my $cv = AE::cv();
     if ($self->[PENDING]) {
-        push @{$self->[PENDING]}, [$cv, $count];
+        push @{$self->[PENDING]}, [$cv, $count, $timeout];
     }
     else {
-        $self->[PENDING] = [[$cv, $count]];
+        $self->[PENDING] = [[$cv, $count, $timeout]];
         $self->_next_pending;
     }
     return $cv;
@@ -164,7 +165,9 @@ sub response_cv {
 
 sub call_cv {
     my $self = shift;
-    return $self->request(@_)->response_cv;
+    my $cv = $self->response_cv(1);
+    $self->request(@_);
+    return $cv;
 }
 
 1;
@@ -233,8 +236,8 @@ exception is raised if socket connection fails.
 Sends a request to the server in the usual "array of bulk strings"
 style or dies trying.  The contents of @args should be byte-strings:
 any strings which may contain wide chars should be converted before
-sending.  Blocking I/O is used, but the event loop will run while
-waiting if L<AnyEvent> is in use.
+sending.  The operation will throw an exception if it fails, including
+if it blocks for longer than the L</"timeout"> value.
 
 =head2 request_raw
 
@@ -243,10 +246,11 @@ waiting if L<AnyEvent> is in use.
 Sends one or more @strings, each followed by CRLF, to the server, or
 dies trying.  The request() method is written in terms of this, but
 you can use it to send commands in the "inline" style if you want to.
+Same timeout/exception semantics as request().
 
 =head2 response
 
-    @data = $client->response($count);
+    @data = $client->response($count, $timeout);
     $data = $client->response;
 
 Blocks and waits for $count responses (default 1), returning the data
@@ -256,14 +260,17 @@ representation.  In scalar context, returns the B<last> item of @data.
 
 A $count of zero always returns an empty list but has the useful side
 effect of blocking until all L</"response_cv"> operations complete,
-like wait_all_responses() in L<Redis>.
+like wait_all_responses() in L<Redis>.  If a $timeout is not given,
+the current L</"timeout"> is used.  The timeout does not start until
+any queued response_cv() operations are complete.
 
 =head2 call
 
     $data = $client->call(@args);
 
 Sends @args via request(), waits for a single response, and returns
-the response $data or raises an exception if an error prevents this.
+the response $data or raises an exception if an error prevents this or
+if the total execution time reaches the L</"timeout"> value.
 
 =head2 available_responses
 
@@ -277,27 +284,28 @@ could be requested without blocking.  If $count is a true value, it
 sets an upper limit on the number of responses to receive or report;
 if it's false, the upper limit is imposed by the parser.  The main
 difference is that the open-ended version will parse as much data as
-is available, whereas the $count-limited version will return quickly
-if the count is satisfied.
+is available, whereas the $count-limited version will stop parsing and
+return if the count is satisfied.
 
 Note that this will immediately return zero/empty if called when any
 response_cv() operations are in progress.
 
 =head2 await_response
 
-    $client = $client->await_response($count);
+    $client = $client->await_response($count, $timeout);
 
 This is a simple blocking operation which returns when at least $count
 responses are available, defaulting to 1 if false.  If there are any
 response_cv() operations in progress, this will wait for them to
-complete first.  Returns self when ready.
+complete before starting the timeout.  Uses L</"timeout"> if $timeout
+is omitted.  Dies on timeout or other stream errors.
 
 Use this in conjunction with available_responses() if no responses are
 available and you have nothing better to do than wait for one.
 
 =head2 response_cv
 
-    $cv = $client->response_cv($count);
+    $cv = $client->response_cv($count, $timeout);
 
 Asynchronous response handling: only available if you have loaded the
 L<AnyEvent> module.  Differs from response() in that it does not block
@@ -306,46 +314,57 @@ the requested number of responses can't be obtained due to parser or
 stream failure, the $cv will croak.
 
 Calling response_cv() again before the previous one is complete is
-permitted: the requests are queued in the natural FIFO order.  The
-response() method can also be called while response_cv() operations
-are in progress: it will block until all pending responses are
-received; you may use C<< $client->response(0) >> to wait for all
-asynchronous requests to complete without fetching any more data.
+permitted: the requests are queued in the natural FIFO order.  Using a
+$count of zero is permitted and acts as a synchronisation point: no
+data is returned, but the $cv sends when the operation reaches the
+head of the queue.
+
+The response() method can also be called when response_cv() operations
+are in progress: it will wait until all queued operations complete,
+then receive responses.  You may use C<< $client->response(0) >> as a
+synchronisation point: it returns no data but blocks until all queued
+operations complete.
 
 =head2 call_cv
 
     $cv = $client->call_cv(@args);
 
 Sends @args via request() and returns an L<AnyEvent> condition
-variable to deliver the response data.
+variable to deliver the response data.  The response handler is set up
+before the request is sent, which is best practice for avoiding I/O
+deadlock.  The L</"timeout"> is applied independently to the request
+and response parts due to their asynchronous operation.
 
 =head2 timeout
 
     $client = $client->timeout($duration);
+    $seconds = $client->timeout;
 
-You can specify a time limit for request/response operations.  The
-default is undef, meaning no limit.  The duration can be set to a
-number of seconds or a time-unit string as accepted by to_seconds() in
-L<Time::Left>; invalid values will result in an exception.  Operations
-which exceed the time limit are aborted with an error.  In the case of
-response_cv(), the timer starts when it reaches the head of the queue.
+This is a get/set attribute for the time limit on blocking operations.
+Where practical, operations also allow the timeout to be specified on
+a case-by-case basis as a parameter, in which case this value is the
+default.  The initial value is undef, meaning no limit.  The $duration
+can be set to a number of seconds or a time-unit string as accepted by
+to_seconds() in L<Time::Left>; invalid values result in an exception.
+
+Operations which exceed the time limit are aborted with an error.
 Bear in mind that a timeout is a fatal error on the underlying stream,
-not a soft interrupt.
+not a soft interrupt.  In the case of response_cv(), the timer starts
+when it reaches the head of the queue.
 
 If you want to impose a timeout on a group of response() operations,
 dynamically adjust this timeout between calls using a L<Time::Left>
-object or similar.  Asynchronous response_cv() calls can do the same
-thing only if they set a callback on the CV in advance and adjust the
-timeout during the callback: the callback is executed before the next
-timer starts.  It may be simpler to impose the limit with a separate
-L<AnyEvent> timer that shuts down the stream or similar.
+object or similar.  Asynchronous response_cv() calls are harder to
+manage in this way because they are usually set up in advance.  In an
+asynchronous context it may be simpler to impose the limit with a
+separate L<AnyEvent> timer that shuts down the stream or similar.
 
 =head2 socket
 
     $socket = $client->socket;
 
 Provides access to the socket created at new().  If a connected socket
-was provided at new(), this returns that socket.
+was provided at new(), that socket is returned.
 
 =head1 ERRORS
 
