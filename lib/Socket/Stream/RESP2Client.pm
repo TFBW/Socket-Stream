@@ -3,7 +3,7 @@ use strict;
 use warnings;
 
 package Socket::Stream::RESP2Client;
-our $VERSION = '0.990';
+our $VERSION = '0.999';
 
 use Socket::Stream;
 use Socket::Stream::RESP2Parser;
@@ -55,9 +55,15 @@ sub request_raw {
 
 sub request {
     my $self = shift;
-    my $n = @_;
+    my $n = grep { ref } @_;
+    _die("BUG: request() args must be all scalars or arrayrefs")
+        unless $n == 0 or $n == @_;
+    my @data = $n > 0 ? @_ : [@_];
     return $self->request_raw(
-        "*$n", map { defined ? ('$'.length($_), $_) : '$-1' } @_
+        map {
+            $n = @$_;
+            "*$n", map { defined ? ('$'.length($_), $_) : '$-1' } @$_
+        } @data
         );
 }
 
@@ -74,8 +80,12 @@ sub response {
 
 sub call {
     my $self = shift;
+    my $n = grep { ref } @_;
+    _die("BUG: call() args must be all scalars or arrayrefs")
+        unless $n == 0 or $n == @_;
+    my @data = $n > 0 ? @_ : [@_];
     my $timer = _timer($self->timeout);
-    return $self->request(@_)->response(1, $timer->remaining);
+    return $self->request(@data)->response(scalar(@data), $timer->remaining);
 }
 
 sub available_responses {
@@ -165,8 +175,12 @@ sub response_cv {
 
 sub call_cv {
     my $self = shift;
-    my $cv = $self->response_cv(1);
-    $self->request(@_);
+    my $n = grep { ref } @_;
+    _die("BUG: call_cv() args must be all scalars or arrayrefs")
+        unless $n == 0 or $n == @_;
+    my @data = $n > 0 ? @_ : [@_];
+    my $cv = $self->response_cv(scalar(@data));
+    $self->request(@data);
     return $cv;
 }
 
@@ -182,39 +196,135 @@ Socket::Stream::RESP2Client - RESP2 (Redis) client using Socket::Stream
     use Socket::Stream::RESP2Client;
     $client = Socket::Stream::RESP2Client->new($socket);
     $client = $client->request(@args);
+    $client = $client->request(\@cmd1, \@cmd2, ...);
     $client = $client->request_raw(@strings);
-    @data = $client->response($count);
     $data = $client->response;
+    @data = $client->response($count);
     $data = $client->call(@args);
+    @data = $client->call(\@cmd1, \@cmd2, ...);
     @data = $client->available_responses($count);
     $n = $client->available_responses($count);
     $client = $client->await_response($count);
     $cv = $client->response_cv($count);
     $cv = $client->call_cv(@args);
     $client = $client->timeout($duration);
+    $seconds = $client->timeout;
     $socket = $client->socket;
 
 =head1 DESCRIPTION
 
 This is a simple low-level RESP2 (Redis) client interface based around
-L<Socket::Stream> and L<Socket::Stream::RESP2Parser>.  It is low-level
-in that is has no knowledge of any Redis commands, only the protocol
-(RESP2) which conveys them.  This is a fairly thin convenience layer
-over L<Socket::Stream> and L<Socket::Stream::RESP2Parser> except for
-the management of asynchronous responses via L</"response_cv">, which
-adds substantial logic.
+L<Socket::Stream> and L<Socket::Stream::RESP2Parser>.  It is mostly a
+thin convenience layer over those modules, but adds some sophisticated
+queue management of asynchronous responses.  It is low-level in that
+it has no knowledge of Redis commands, only the protocol (RESP2) which
+conveys them.
 
-Requests are always sent synchronously; responses may be received
-synchronously or, with L<AnyEvent>, asynchronously.  One distinctive
-feature of this module is the ability to pipeline commands to a much
-greater extent than usual: you can even set up asynchronous response
-handlers in advance, then send the associated requests.  This pattern
-is highly efficient and can outperform L<Redis::Fast> in some cases.
+=head2 Design Principles
+
+This module operates on the following core principles.
+
+=head3 Fatal Errors
+
+Errors are unrecoverable.  Once an error occurs (timeout, connection
+loss, protocol violation), the entire session is considered failed.
+You must create a new client object with a fresh socket to continue.
+There are no retry mechanisms or error recovery procedures: the object
+becomes more or less useless and will fail any further operations.
+
+Long-running applications should handle connection failure gracefully,
+as servers restart and networks fail.  The appropriate recovery method
+will vary according to the application.  This also has implications
+for batching of operations, as it will generally be unclear where in
+the batch the failure occurred, exactly.
+
+=head3 Synchronous Send, Flexible Receive
+
+Requests are sent synchronously and block until complete.  Responses
+can be received either synchronously (blocking) or asynchronously (via
+L<AnyEvent> condition variables). This asymmetry enables sophisticated
+pipeline management while keeping the sending side simple.
+
+Note that actual blocking on send tends to be rare, and is handled in
+such a way that async response handlers can still execute, but the
+possibililty of blocking generally precludes requests from being sent
+in async handler code executed by the event loop.  If you violate this
+rule, it may result in an exception when blocking occurs.
+
+=head3 Batching and Pipeline Control
+
+The module supports aggressive pipelining - you can send many requests
+before reading any responses.  Unlike most Redis clients, requests and
+responses are independent and can support multiple operations in one
+call, so you can efficiently maintain a level of outstanding requests
+in the pipeline.  You can also set up asynchronous response handlers
+before sending the associated requests, which is the optimal pattern
+for preventing I/O deadlock.
+
+The L</"EXAMPLES"> section includes demonstrations of these concepts
+in greater detail.
+
+=head3 Timeouts
+
+Time limits can be imposed on most operations via the L</"timeout">
+attribute, and also via a direct argument in some cases.  The default
+behaviour is no time limit.  Timeouts are L</"Fatal Errors">, and
+their intended use is to induce rapid failure where that is preferable
+to lengthy pauses.
+
+Depending on the exact time limits you wish to impose, however, it may
+be simpler to manage them externally.  This is particularly likely
+when a group of operations, rather than an individual one, is subject
+to a time limit.  This module uses L<Time::Left> to track timeout
+deadlines, so consider using it if you need something like it.
+
+=head2 Synchronous/Asynchronous Interaction
+
+The module supports both synchronous and (if L<AnyEvent> is loaded)
+asynchronous responses, even in the same session.  This creates
+potentially ambiguous semantics which require clarification, such as
+what happens when a synchronous response is requested while an
+asynchronous one is still outstanding.  The rules are as follows.
+
+=head3 Async Operations Queue
+
+When you call C<response_cv()>, the operation is added to a FIFO queue
+and an L<AnyEvent> condition variable is returned to convey the future
+result.  Arbitrarily many C<response_cv()> calls can be queued: each
+operation awaits its turn, then waits for its required number of
+responses.  Note that the behaviour of synchronous responses can vary
+depending on whether async operations are in progress.
+
+=head3 Sync Operations Wait
+
+If you call C<response()> while async operations are queued, it blocks
+until all queued operations complete, then receives its responses.
+That is, it joins the queue.  You can use C<< $client->response(0) >>
+as a synchronization point - it returns no data but waits for all
+async operations in the queue at call time to finish.
+
+=head3 Available Responses Check
+
+The C<available_responses()> method returns empty immediately if any
+async operations are pending.  It is a non-blocking operation, and no
+responses are available to it until queued operations are satisfied,
+particularly given that more operations could join the queue.  There's
+no good reason to mix this with async operations, but there's no harm.
+
+=head3 Timeout Behavior
+
+The start of the time limit varies depending on the operation.  For
+blocking operations, it simply refers to the entire operation: when it
+is called to when it returns.  For C<response_cv()>, it doesn't start
+until the operation reaches the head of the queue, which could be some
+time after the method call.  For C<call_cv()>, the timeout is applied
+separately to the request and response: the method itself may block to
+send the request, and the response handler may be queued.
 
 =head1 METHODS
 
-The module is object-oriented and has the following methods.  Note
-that any exceptions or failures are generally unrecoverable: once you
+The module is object-oriented and has the following methods.  Bear in
+mind that exceptions or failures are generally unrecoverable: once you
 encounter one, you should dispose of the object and its socket rather
 than attempt further communication.  "Blocking" operations allow the
 event loop to run if the L<AnyEvent> module is loaded.
@@ -232,12 +342,15 @@ exception is raised if socket connection fails.
 =head2 request
 
     $client = $client->request(@args);
+    $client = $client->request(\@cmd1, \@cmd2, ...);
 
 Sends a request to the server in the usual "array of bulk strings"
-style or dies trying.  The contents of @args should be byte-strings:
-any strings which may contain wide chars should be converted before
-sending.  The operation will throw an exception if it fails, including
-if it blocks for longer than the L</"timeout"> value.
+style or dies trying.  The contents of @args should either be strings
+or undef (for NULL).  Strings must be byte-strings: wide chars should
+be converted to a byte encoding before sending.  You can send a batch
+of requests by passing a list of arrayrefs.  The operation will throw
+an exception if it fails, including if it blocks for longer than the
+L</"timeout"> value.
 
 =head2 request_raw
 
@@ -246,7 +359,9 @@ if it blocks for longer than the L</"timeout"> value.
 Sends one or more @strings, each followed by CRLF, to the server, or
 dies trying.  The request() method is written in terms of this, but
 you can use it to send commands in the "inline" style if you want to.
-Same timeout/exception semantics as request().
+Same timeout/exception semantics as request().  Bear in mind that the
+"_raw" suffix designates a responsibility on the caller's part to
+provide @strings which are protocol-appropriate.
 
 =head2 response
 
@@ -256,21 +371,25 @@ Same timeout/exception semantics as request().
 Blocks and waits for $count responses (default 1), returning the data
 as parsed by L<Socket::Stream::RESP2Parser>, or raising an exception
 if that is not possible.  Refer to that class for details on the data
-representation.  In scalar context, returns the B<last> item of @data.
+representation.  In scalar context, returns the B<last> item of @data
+as per Perl C<slice()> semantics.
 
 A $count of zero always returns an empty list but has the useful side
 effect of blocking until all L</"response_cv"> operations complete,
-like wait_all_responses() in L<Redis>.  If a $timeout is not given,
+like C<wait_all_responses()> in L<Redis>.  If a $timeout is not given,
 the current L</"timeout"> is used.  The timeout does not start until
-any queued response_cv() operations are complete.
+any queued C<response_cv()> operations are complete.
 
 =head2 call
 
     $data = $client->call(@args);
+    @data = $client->call(\@cmd1, \@cmd2, ...);
 
-Sends @args via request(), waits for a single response, and returns
-the response $data or raises an exception if an error prevents this or
-if the total execution time reaches the L</"timeout"> value.
+Combines C<request()> and C<response()> in a single call.  Sends @args
+via C<request()> and then calls C<response()> with a matching count:
+if the arrayref form is used with multiple requests, the same number
+of resposes are expected.  The returned @data is as per C<response()>.
+The timeout applies to the operation as a whole.
 
 =head2 available_responses
 
@@ -282,13 +401,13 @@ are immediately available.  In a list context, it receives the actual
 responses; in a scalar context it returns a count of responses which
 could be requested without blocking.  If $count is a true value, it
 sets an upper limit on the number of responses to receive or report;
-if it's false, the upper limit is imposed by the parser.  The main
-difference is that the open-ended version will parse as much data as
-is available, whereas the $count-limited version will stop parsing and
-return if the count is satisfied.
+if it's false, the limit is imposed by L<Socket::Stream::RESP2Parser>.
+The main difference is that the open-ended version will parse as much
+data as is available, whereas the $count-limited version will stop
+parsing and return if the count is satisfied.
 
 Note that this will immediately return zero/empty if called when any
-response_cv() operations are in progress.
+C<response_cv()> operations are in progress.
 
 =head2 await_response
 
@@ -296,44 +415,47 @@ response_cv() operations are in progress.
 
 This is a simple blocking operation which returns when at least $count
 responses are available, defaulting to 1 if false.  If there are any
-response_cv() operations in progress, this will wait for them to
+C<response_cv()> operations in progress, this will wait for them to
 complete before starting the timeout.  Uses L</"timeout"> if $timeout
 is omitted.  Dies on timeout or other stream errors.
 
-Use this in conjunction with available_responses() if no responses are
-available and you have nothing better to do than wait for one.
+Use this in conjunction with C<available_responses()> if no responses
+are available and you have nothing better to do than wait for one.
 
 =head2 response_cv
 
     $cv = $client->response_cv($count, $timeout);
 
 Asynchronous response handling: only available if you have loaded the
-L<AnyEvent> module.  Differs from response() in that it does not block
-and delivers the data via $cv, an L<AnyEvent> condition variable.  If
-the requested number of responses can't be obtained due to parser or
-stream failure, the $cv will croak.
+L<AnyEvent> module.  Differs from C<response()> in that it immediately
+returns $cv, an L<AnyEvent> condition variable, via which it reports
+the data.  If the requested number of responses can't be obtained due
+to parser or stream failure, the $cv will croak.
 
-Calling response_cv() again before the previous one is complete is
+Calling C<response_cv()> again before the previous one is complete is
 permitted: the requests are queued in the natural FIFO order.  Using a
 $count of zero is permitted and acts as a synchronisation point: no
-data is returned, but the $cv sends when the operation reaches the
-head of the queue.
+data is returned, but the $cv sends an enpty list when the operation
+reaches the head of the queue.
 
-The response() method can also be called when response_cv() operations
-are in progress: it will wait until all queued operations complete,
-then receive responses.  You may use C<< $client->response(0) >> as a
-synchronisation point: it returns no data but blocks until all queued
-operations complete.
+When C<response_cv()> operations are in progress, the C<response()>
+method will pause until all queued operations complete, then receive
+responses.  You may use C<< $client->response(0) >> to block until all
+queued operations complete without receiving any further data.
 
 =head2 call_cv
 
     $cv = $client->call_cv(@args);
+    $cv = $client->call_cv(\@cmd1, \@cmd2, ...);
 
-Sends @args via request() and returns an L<AnyEvent> condition
-variable to deliver the response data.  The response handler is set up
-before the request is sent, which is best practice for avoiding I/O
+Combines C<request()> and C<response_cv()> in a single call.  Sends
+@args via C<request()> and returns an L<AnyEvent> condition variable
+to deliver the corresponding responses.  The response handler is set
+up before the request is sent, which is best practice for avoiding I/O
 deadlock.  The L</"timeout"> is applied independently to the request
-and response parts due to their asynchronous operation.
+and response parts as per C<request()> and C<response_cv()>.  This
+means the method itself could die (error on request), or the $cv could
+croak (error on response).
 
 =head2 timeout
 
@@ -349,15 +471,8 @@ to_seconds() in L<Time::Left>; invalid values result in an exception.
 
 Operations which exceed the time limit are aborted with an error.
 Bear in mind that a timeout is a fatal error on the underlying stream,
-not a soft interrupt.  In the case of response_cv(), the timer starts
-when it reaches the head of the queue.
-
-If you want to impose a timeout on a group of response() operations,
-dynamically adjust this timeout between calls using a L<Time::Left>
-object or similar.  Asynchronous response_cv() calls are harder to
-manage in this way because they are usually set up in advance.  In an
-asynchronous context it may be simpler to impose the limit with a
-separate L<AnyEvent> timer that shuts down the stream or similar.
+not a soft interrupt.  See the earlier sections on L</"Timeouts"> and
+L</"Timeout Behaviour"> for more detail.
 
 =head2 socket
 
@@ -365,15 +480,6 @@ separate L<AnyEvent> timer that shuts down the stream or similar.
 
 Provides access to the socket created at new().  If a connected socket
 was provided at new(), that socket is returned.
-
-=head1 ERRORS
-
-If a request or response method fails for any reason, consider the
-whole RESP2 session failed beyond recovery.  You will need to start
-from scratch with a new client object and socket if you want to
-perform further operations.  Long-running applications should always
-remain aware that servers need to restart occasionally, so loss of
-connectivity should be handled gracefully.
 
 =head1 EXAMPLES
 
@@ -385,11 +491,12 @@ a short tutorial on pipeline performance.
 The examples will start with the most basic and build towards more
 efficient and sophisticated solutions.  Each example is a function
 which takes a total $count and $batch size to use when performing a
-single operation, specifically "set hoge fuga", repeatedly.  The
-function returns the number of errors encountered, which is a feature
-not present in the original L<Redis::Fast> example.  The original
-example did not have batching, either: all the work was processed in a
-single huge batch.
+single operation (specifically "set hoge fuga") repeatedly.  The
+function returns the number of errors encountered, a feature not in
+the original L<Redis::Fast> example.  The original example did not
+have batching, either: all the work was processed in one huge batch.
+
+=head2 Redis Baseline
 
 The first example is a translation of the original L<Redis::Fast>
 example code into this batched-subroutine format.
@@ -415,6 +522,8 @@ The batch of commands is sent, and we await the responses.  Each batch
 is a simple pipeline where everything is added to the pipeline, then
 everything is extracted from it.  Larger batches use more memory.
 
+=head2 Basic Blocking
+
 Here's the same concept in terms of this module.
 
     use Socket::Stream::RESP2Client;
@@ -439,10 +548,12 @@ performs comparably to L<Redis::Fast> in this context, getting better
 with larger batch sizes.  The speed of L<Redis::Fast> is mostly a
 factor of its parser, and there's not a lot to parse here.
 
+=head2 Staged Blocking
+
 Both these examples violate the first rule of pipelining, however:
 "keep your pipeline as small as possible without letting it run dry."
 Both examples run dry at the end of each batch.  This means there is
-idle time at the server whille it waits for the next batch.  The next
+idle time at the server while it waits for the next batch.  The next
 example solves this by having a "staged" approach where the response
 processing of the first batch is postponed until after the second
 batch of requests has been sent.  Requests and responses are counted
@@ -476,6 +587,8 @@ small as 100, making Redis itself the bottleneck.  L<Redis::Fast>
 can't reach that kind of throughput with this workload: its parser
 performance doesn't help given the simple "+OK" responses expected.
 
+=head2 Opportunistic Blocking
+
 A variation on this pattern is to read available responses, sending
 another batch of requests when the total number in the pipeline is one
 batch or less.  Performance-wise this isn't much different from the
@@ -505,10 +618,12 @@ is limited to one batch so we don't neglect the send side too long.
         return $err;
     }
 
+=head2 Staged Asynchronous
+
 The last example is asynchronous and requires L<AnyEvent>.  This is
 like the staged approach, but L<AnyEvent> condition variables are used
 to limit the send rate.  Note that the response handler is set up
-before the requests are sent -- the textbook-correct way to prevent
+before the requests are sent - the textbook-correct way to prevent
 communications deadlock.
 
     use Socket::Stream::RESP2Client;
