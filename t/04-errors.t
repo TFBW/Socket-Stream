@@ -38,7 +38,7 @@ subtest "Fill send buffer and time out" => sub {
         }
     }
     is($xsubs, 0, "Closure destroyed");
-    diag("Sent $count bytes before failing");
+    note("Sent $count bytes before failing");
     is($err, Socket::Stream::ETIMEDOUT, "send_data reached limit and timed out");
     is($err, $s1->send_err, "send_err matches");
 };
@@ -165,7 +165,7 @@ subtest "Write to closed socket" => sub {
     ok($err, "send_err is true ($err)");
     is($xsubs, 0, "Closure destroyed");
     is($err, $s1->send_err, "send_err matches");
-    diag("SIGPIPE received? $sig");
+    note("SIGPIPE received? $sig");
 };
 
 done_testing(7);
